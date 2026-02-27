@@ -191,7 +191,7 @@ def transcribe_file(
         diarize_segments = diarize_pipeline(
             {"waveform": torch.from_numpy(audio_tensor).unsqueeze(0), "sample_rate": 16000}
         )
-        result = whisperx.assign_word_speakers(diarize_segments, {"segments": segments})
+        result = whisperx.diarize.assign_word_speakers(diarize_segments, {"segments": segments})
         segments = result.get("segments", segments)
     except Exception as diar_exc:
         print(f"\n  [warn] diarization failed ({diar_exc}), speaker labels will be UNKNOWN")
@@ -304,7 +304,7 @@ def main():
     if diarize:
         print("Loading pyannote diarization model...")
         try:
-            diarize_pipeline = whisperx.DiarizationPipeline(
+            diarize_pipeline = whisperx.diarize.DiarizationPipeline(
                 use_auth_token=hf_token,
                 device=device,
             )
