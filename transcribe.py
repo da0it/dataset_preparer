@@ -161,8 +161,6 @@ def transcribe_file(
       timed_text    — segments with timestamps
       speakers_text — segments with timestamps + speaker labels, or None if diarization skipped
     """
-    import torch
-
     # Step 1: transcribe
     result = model.transcribe(str(audio_path), language=language, batch_size=16)
     segments = result.get("segments", [])
@@ -187,10 +185,7 @@ def transcribe_file(
 
     # Step 3: diarize
     try:
-        audio_tensor = whisperx.load_audio(str(audio_path))
-        diarize_segments = diarize_pipeline(
-            {"waveform": torch.from_numpy(audio_tensor).unsqueeze(0), "sample_rate": 16000}
-        )
+        diarize_segments = diarize_pipeline(str(audio_path))
         result = whisperx.diarize.assign_word_speakers(diarize_segments, {"segments": segments})
         segments = result.get("segments", segments)
     except Exception as diar_exc:
@@ -304,19 +299,15 @@ def main():
     if diarize:
         print("Loading pyannote diarization model...")
         try:
-            # pyannote >= 3.x uses `token`, older versions use `use_auth_token`
-            try:
-                diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                    token=hf_token,
-                    device=device,
-                )
-            except TypeError:
-                diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                    use_auth_token=hf_token,
-                    device=device,
-                )
+            diarize_pipeline = whisperx.diarize.DiarizationPipeline(
+                token=hf_token,
+                device=device,
+            )
+            print("Diarization pipeline loaded successfully.")
         except Exception as exc:
-            print(f"Warning: could not load diarization pipeline: {exc}", file=sys.stderr)
+            import traceback
+            print(f"Warning: could not load diarization pipeline:", file=sys.stderr)
+            traceback.print_exc()
             print("Continuing without diarization — only plain and timed CSVs will be produced.")
             diarize_pipeline = None
             diarize = False
