@@ -145,16 +145,24 @@ def transcribe_file(
     model,
     language: str,
     diarize_pipeline,
+    align_model,        # pre-loaded once before the loop, or None
+    align_metadata,     # pre-loaded once before the loop, or None
     device: str,
 ) -> tuple[str, str, str | None]:
     """
     Transcribe and optionally diarize a single audio file.
+
+    align_model / align_metadata must be loaded once outside the loop and
+    passed in here — loading them per-file causes a memory leak that kills
+    the process after several hundred files.
 
     Returns:
       plain_text    — all segments joined
       timed_text    — segments with timestamps
       speakers_text — segments with timestamps + speaker labels, or None if diarization skipped
     """
+    import torch
+
     # Step 1: transcribe
     result = model.transcribe(str(audio_path), language=language, batch_size=16)
     segments = result.get("segments", [])
@@ -166,25 +174,23 @@ def transcribe_file(
     if diarize_pipeline is None:
         return plain_text, timed_text, None
 
-    # Step 2: align (required before diarization for word-level timestamps)
-    try:
-        align_model, metadata = whisperx.load_align_model(
-            language_code=language, device=device
-        )
-        result = whisperx.align(
-            segments, align_model, metadata, str(audio_path), device,
-            return_char_alignments=False,
-        )
-        segments = result.get("segments", segments)
-    except Exception as align_exc:
-        print(f"\n  [warn] alignment failed ({align_exc}), using unaligned segments for diarization")
+    # Step 2: align — uses the pre-loaded model, no allocation per file
+    if align_model is not None:
+        try:
+            result = whisperx.align(
+                segments, align_model, align_metadata, str(audio_path), device,
+                return_char_alignments=False,
+            )
+            segments = result.get("segments", segments)
+        except Exception as align_exc:
+            print(f"\n  [warn] alignment failed ({align_exc}), using unaligned segments")
 
     # Step 3: diarize
     try:
-        import torch
         audio_tensor = whisperx.load_audio(str(audio_path))
-        diarize_segments = diarize_pipeline({"waveform": torch.from_numpy(audio_tensor).unsqueeze(0),
-                                             "sample_rate": 16000})
+        diarize_segments = diarize_pipeline(
+            {"waveform": torch.from_numpy(audio_tensor).unsqueeze(0), "sample_rate": 16000}
+        )
         result = whisperx.assign_word_speakers(diarize_segments, {"segments": segments})
         segments = result.get("segments", segments)
     except Exception as diar_exc:
@@ -291,8 +297,10 @@ def main():
         language=args.language,
     )
 
-    # Load diarization pipeline (optional)
+    # Load diarization pipeline + alignment model (optional, both loaded once)
     diarize_pipeline = None
+    align_model = None
+    align_metadata = None
     if diarize:
         print("Loading pyannote diarization model...")
         try:
@@ -305,6 +313,18 @@ def main():
             print("Continuing without diarization — only plain and timed CSVs will be produced.")
             diarize_pipeline = None
             diarize = False
+
+        if diarize_pipeline is not None:
+            print("Loading alignment model...")
+            try:
+                align_model, align_metadata = whisperx.load_align_model(
+                    language_code=args.language, device=device
+                )
+            except Exception as exc:
+                print(f"Warning: could not load alignment model: {exc}", file=sys.stderr)
+                print("Diarization will proceed without word-level alignment.")
+                align_model = None
+                align_metadata = None
 
     # Open output files
     plain_file, plain_writer = open_csv(plain_path)
@@ -320,7 +340,8 @@ def main():
             t0 = time.monotonic()
             try:
                 plain_text, timed_text, speakers_text = transcribe_file(
-                    audio_path, model, args.language, diarize_pipeline, device
+                    audio_path, model, args.language,
+                    diarize_pipeline, align_model, align_metadata, device
                 )
                 plain_writer.writerow(make_row(audio_path.name, plain_text))
                 timed_writer.writerow(make_row(audio_path.name, timed_text))
