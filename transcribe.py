@@ -304,10 +304,17 @@ def main():
     if diarize:
         print("Loading pyannote diarization model...")
         try:
-            diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                use_auth_token=hf_token,
-                device=device,
-            )
+            # pyannote >= 3.x uses `token`, older versions use `use_auth_token`
+            try:
+                diarize_pipeline = whisperx.diarize.DiarizationPipeline(
+                    token=hf_token,
+                    device=device,
+                )
+            except TypeError:
+                diarize_pipeline = whisperx.diarize.DiarizationPipeline(
+                    use_auth_token=hf_token,
+                    device=device,
+                )
         except Exception as exc:
             print(f"Warning: could not load diarization pipeline: {exc}", file=sys.stderr)
             print("Continuing without diarization — only plain and timed CSVs will be produced.")
