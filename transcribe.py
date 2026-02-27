@@ -19,12 +19,14 @@ Columns in both CSVs:
 import argparse
 import csv
 import sys
+import time
+from datetime import timedelta
 from pathlib import Path
 
 import whisperx
 
 CSV_COLUMNS = ["filename", "text", "is_training_sample", "call_purpose", "priority", "assigned_group"]
-DEFAULT_MODEL = "large-v2"
+DEFAULT_MODEL = "large-v3"
 DEFAULT_LANGUAGE = "ru"
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
@@ -188,19 +190,33 @@ def main():
     plain_file, plain_writer = open_csv(plain_path)
     timed_file, timed_writer = open_csv(timed_path)
 
+    total = len(to_process)
+    durations: list[float] = []  # per-file transcription times for ETA
+
     try:
         for idx, audio_path in enumerate(to_process, start=1):
-            print(f"[{idx}/{len(to_process)}] {audio_path.name} ...", end=" ", flush=True)
+            print(f"[{idx}/{total}] {audio_path.name} ...", end=" ", flush=True)
+            t0 = time.monotonic()
             try:
                 plain_text, timed_text = transcribe_file(audio_path, model, args.language)
                 plain_writer.writerow(make_row(audio_path.name, plain_text))
                 timed_writer.writerow(make_row(audio_path.name, timed_text))
-                print("done")
+                status = "done"
             except Exception as exc:
-                print(f"ERROR: {exc}", file=sys.stderr)
+                print(f"\nERROR: {exc}", file=sys.stderr)
                 err_text = f"[TRANSCRIPTION_ERROR: {exc}]"
                 plain_writer.writerow(make_row(audio_path.name, err_text))
                 timed_writer.writerow(make_row(audio_path.name, err_text))
+                status = "error"
+
+            elapsed = time.monotonic() - t0
+            durations.append(elapsed)
+
+            avg = sum(durations) / len(durations)
+            remaining = avg * (total - idx)
+            eta_str = str(timedelta(seconds=int(remaining)))
+
+            print(f"{status}  ({elapsed:.1f}s)  ETA: {eta_str}")
 
             # Flush both files after each record so progress is not lost on crash
             plain_file.flush()
@@ -209,7 +225,8 @@ def main():
         plain_file.close()
         timed_file.close()
 
-    print(f"\nDone.")
+    total_time = str(timedelta(seconds=int(sum(durations))))
+    print(f"\nDone in {total_time}.")
     print(f"  Plain text : {plain_path}")
     print(f"  Timed text : {timed_path}")
 
