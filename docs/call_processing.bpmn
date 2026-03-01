@@ -1,0 +1,339 @@
+
+  <process id="proc_call_handling" name="Обработка входящего звонка" isExecutable="true">
+
+    <!-- Participants / Lanes -->
+    <laneSet id="ls_call">
+      <lane id="lane_client" name="Клиент">
+        <flowNodeRef>start_call</flowNodeRef>
+        <flowNodeRef>task_client_talks</flowNodeRef>
+        <flowNodeRef>task_client_hangup</flowNodeRef>
+      </lane>
+      <lane id="lane_telephony" name="IP-телефония">
+        <flowNodeRef>task_receive_call</flowNodeRef>
+        <flowNodeRef>task_record_audio</flowNodeRef>
+        <flowNodeRef>task_send_api</flowNodeRef>
+      </lane>
+      <lane id="lane_ml" name="ML-сервис">
+        <flowNodeRef>task_transcribe</flowNodeRef>
+        <flowNodeRef>task_classify</flowNodeRef>
+        <flowNodeRef>task_summarize</flowNodeRef>
+        <flowNodeRef>task_create_ticket</flowNodeRef>
+        <flowNodeRef>task_notify_assignee</flowNodeRef>
+      </lane>
+      <lane id="lane_operator" name="Оператор 1-й линии">
+        <flowNodeRef>task_answer_call</flowNodeRef>
+        <flowNodeRef>task_review_result</flowNodeRef>
+        <flowNodeRef>gw_confidence</flowNodeRef>
+        <flowNodeRef>gw_corrected</flowNodeRef>
+        <flowNodeRef>task_correct_prediction</flowNodeRef>
+        <flowNodeRef>task_save_correction</flowNodeRef>
+        <flowNodeRef>end_call</flowNodeRef>
+      </lane>
+    </laneSet>
+
+    <!-- Start -->
+    <startEvent id="start_call" name="Клиент совершает звонок">
+      <outgoing>sf_start_to_receive</outgoing>
+    </startEvent>
+
+    <!-- Telephony lane -->
+    <serviceTask id="task_receive_call" name="Зафиксировать входящий звонок">
+      <incoming>sf_start_to_receive</incoming>
+      <outgoing>sf_receive_to_answer</outgoing>
+    </serviceTask>
+
+    <userTask id="task_answer_call" name="Оператор принимает звонок">
+      <incoming>sf_receive_to_answer</incoming>
+      <outgoing>sf_answer_to_talks</outgoing>
+    </userTask>
+
+    <task id="task_client_talks" name="Разговор">
+      <incoming>sf_answer_to_talks</incoming>
+      <outgoing>sf_talks_to_hangup</outgoing>
+    </task>
+
+    <task id="task_client_hangup" name="Клиент вешает трубку">
+      <incoming>sf_talks_to_hangup</incoming>
+      <outgoing>sf_hangup_to_parallel</outgoing>
+    </task>
+
+    <!-- Parallel gateway: recording + operator post-processing -->
+    <parallelGateway id="gw_parallel_split" name="">
+      <incoming>sf_hangup_to_parallel</incoming>
+      <outgoing>sf_parallel_to_record</outgoing>
+      <outgoing>sf_parallel_to_review</outgoing>
+    </parallelGateway>
+
+    <serviceTask id="task_record_audio" name="Записать аудио">
+      <incoming>sf_parallel_to_record</incoming>
+      <outgoing>sf_record_to_api</outgoing>
+    </serviceTask>
+
+    <serviceTask id="task_send_api" name="Передать аудио + метаданные по API в ML-сервис">
+      <incoming>sf_record_to_api</incoming>
+      <outgoing>sf_api_to_transcribe</outgoing>
+    </serviceTask>
+
+    <!-- ML Sub-process -->
+    <subProcess id="sub_ml" name="ML-обработка">
+      <incoming>sf_api_to_transcribe</incoming>
+      <outgoing>sf_ml_to_join</outgoing>
+
+      <startEvent id="sub_start_ml">
+        <outgoing>sf_sub_to_transcribe</outgoing>
+      </startEvent>
+
+      <serviceTask id="task_transcribe" name="Транскрибировать аудио (WhisperX)">
+        <incoming>sf_sub_to_transcribe</incoming>
+        <outgoing>sf_transcribe_to_classify</outgoing>
+      </serviceTask>
+
+      <serviceTask id="task_classify" name="Классифицировать звонок&#10;(цель / приоритет / группа)">
+        <incoming>sf_transcribe_to_classify</incoming>
+        <outgoing>sf_classify_to_summarize</outgoing>
+      </serviceTask>
+
+      <serviceTask id="task_summarize" name="Сгенерировать саммари звонка">
+        <incoming>sf_classify_to_summarize</incoming>
+        <outgoing>sf_summarize_to_ticket</outgoing>
+      </serviceTask>
+
+      <serviceTask id="task_create_ticket" name="Завести заявку в тикет-системе">
+        <incoming>sf_summarize_to_ticket</incoming>
+        <outgoing>sf_ticket_to_notify</outgoing>
+      </serviceTask>
+
+      <serviceTask id="task_notify_assignee" name="Уведомить исполнителя">
+        <incoming>sf_ticket_to_notify</incoming>
+        <outgoing>sf_notify_to_sub_end</outgoing>
+      </serviceTask>
+
+      <endEvent id="sub_end_ml">
+        <incoming>sf_notify_to_sub_end</incoming>
+      </endEvent>
+
+      <sequenceFlow id="sf_sub_to_transcribe" sourceRef="sub_start_ml" targetRef="task_transcribe"/>
+      <sequenceFlow id="sf_transcribe_to_classify" sourceRef="task_transcribe" targetRef="task_classify"/>
+      <sequenceFlow id="sf_classify_to_summarize" sourceRef="task_classify" targetRef="task_summarize"/>
+      <sequenceFlow id="sf_summarize_to_ticket" sourceRef="task_summarize" targetRef="task_create_ticket"/>
+      <sequenceFlow id="sf_ticket_to_notify" sourceRef="task_create_ticket" targetRef="task_notify_assignee"/>
+      <sequenceFlow id="sf_notify_to_sub_end" sourceRef="task_notify_assignee" targetRef="sub_end_ml"/>
+    </subProcess>
+
+    <!-- Parallel join -->
+    <parallelGateway id="gw_parallel_join" name="">
+      <incoming>sf_ml_to_join</incoming>
+      <incoming>sf_parallel_to_review</incoming>
+      <outgoing>sf_join_to_review</outgoing>
+    </parallelGateway>
+
+    <userTask id="task_review_result" name="Оператор просматривает результат классификации">
+      <incoming>sf_join_to_review</incoming>
+      <outgoing>sf_review_to_confidence</outgoing>
+    </userTask>
+
+    <!-- Confidence gateway -->
+    <exclusiveGateway id="gw_confidence" name="Уверенность модели высокая?">
+      <incoming>sf_review_to_confidence</incoming>
+      <outgoing>sf_confidence_yes</outgoing>
+      <outgoing>sf_confidence_no</outgoing>
+    </exclusiveGateway>
+
+    <userTask id="task_correct_prediction" name="Оператор корректирует&#10;цель / приоритет / группу">
+      <incoming>sf_confidence_no</incoming>
+      <outgoing>sf_correct_to_gw</outgoing>
+    </userTask>
+
+    <exclusiveGateway id="gw_corrected" name="Оператор внёс исправления?">
+      <incoming>sf_correct_to_gw</incoming>
+      <outgoing>sf_corrected_yes</outgoing>
+      <outgoing>sf_corrected_no</outgoing>
+    </exclusiveGateway>
+
+    <serviceTask id="task_save_correction" name="Сохранить исправление как обучающий пример">
+      <incoming>sf_corrected_yes</incoming>
+      <outgoing>sf_save_to_end</outgoing>
+    </serviceTask>
+
+    <endEvent id="end_call" name="Обработка звонка завершена">
+      <incoming>sf_confidence_yes</incoming>
+      <incoming>sf_corrected_no</incoming>
+      <incoming>sf_save_to_end</incoming>
+    </endEvent>
+
+    <!-- Sequence Flows -->
+    <sequenceFlow id="sf_start_to_receive"    sourceRef="start_call"          targetRef="task_receive_call"/>
+    <sequenceFlow id="sf_receive_to_answer"   sourceRef="task_receive_call"   targetRef="task_answer_call"/>
+    <sequenceFlow id="sf_answer_to_talks"     sourceRef="task_answer_call"    targetRef="task_client_talks"/>
+    <sequenceFlow id="sf_talks_to_hangup"     sourceRef="task_client_talks"   targetRef="task_client_hangup"/>
+    <sequenceFlow id="sf_hangup_to_parallel"  sourceRef="task_client_hangup"  targetRef="gw_parallel_split"/>
+    <sequenceFlow id="sf_parallel_to_record"  sourceRef="gw_parallel_split"   targetRef="task_record_audio"/>
+    <sequenceFlow id="sf_parallel_to_review"  sourceRef="gw_parallel_split"   targetRef="gw_parallel_join"/>
+    <sequenceFlow id="sf_record_to_api"       sourceRef="task_record_audio"   targetRef="task_send_api"/>
+    <sequenceFlow id="sf_api_to_transcribe"   sourceRef="task_send_api"       targetRef="sub_ml"/>
+    <sequenceFlow id="sf_ml_to_join"          sourceRef="sub_ml"              targetRef="gw_parallel_join"/>
+    <sequenceFlow id="sf_join_to_review"      sourceRef="gw_parallel_join"    targetRef="task_review_result"/>
+    <sequenceFlow id="sf_review_to_confidence" sourceRef="task_review_result" targetRef="gw_confidence"/>
+    <sequenceFlow id="sf_confidence_yes"      sourceRef="gw_confidence"       targetRef="end_call">
+      <conditionExpression>confidence &gt;= threshold</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_confidence_no"       sourceRef="gw_confidence"       targetRef="task_correct_prediction">
+      <conditionExpression>confidence &lt; threshold</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_correct_to_gw"       sourceRef="task_correct_prediction" targetRef="gw_corrected"/>
+    <sequenceFlow id="sf_corrected_yes"       sourceRef="gw_corrected"        targetRef="task_save_correction">
+      <conditionExpression>corrected == true</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_corrected_no"        sourceRef="gw_corrected"        targetRef="end_call">
+      <conditionExpression>corrected == false</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_save_to_end"         sourceRef="task_save_correction" targetRef="end_call"/>
+  </process>
+
+  <!-- ================================================================ -->
+  <!-- PROCESS 2: Dataset Preparation and Model Training (Admin)        -->
+  <!-- ================================================================ -->
+  <process id="proc_ml_training" name="Подготовка датасета и обучение модели" isExecutable="true">
+
+    <laneSet id="ls_training">
+      <lane id="lane_admin" name="Администратор">
+        <flowNodeRef>start_training</flowNodeRef>
+        <flowNodeRef>task_run_transcription</flowNodeRef>
+        <flowNodeRef>task_annotate</flowNodeRef>
+        <flowNodeRef>task_train_models</flowNodeRef>
+        <flowNodeRef>task_evaluate</flowNodeRef>
+        <flowNodeRef>gw_metrics_ok</flowNodeRef>
+        <flowNodeRef>task_analyze_errors</flowNodeRef>
+        <flowNodeRef>task_deploy</flowNodeRef>
+        <flowNodeRef>end_training</flowNodeRef>
+      </lane>
+      <lane id="lane_system_training" name="ML-система">
+        <flowNodeRef>task_whisperx</flowNodeRef>
+        <flowNodeRef>task_finetune_bert</flowNodeRef>
+        <flowNodeRef>task_train_classical</flowNodeRef>
+        <flowNodeRef>task_retrain</flowNodeRef>
+      </lane>
+      <lane id="lane_operator_training" name="Оператор (дообучение)">
+        <flowNodeRef>task_operator_correction</flowNodeRef>
+        <flowNodeRef>gw_enough_corrections</flowNodeRef>
+      </lane>
+    </laneSet>
+
+    <startEvent id="start_training" name="Накоплен датасет звонков (MP3)">
+      <outgoing>sf_t_start_to_transcription</outgoing>
+    </startEvent>
+
+    <userTask id="task_run_transcription" name="Запустить транскрипцию (transcribe.py)">
+      <incoming>sf_t_start_to_transcription</incoming>
+      <outgoing>sf_t_transcription_to_whisperx</outgoing>
+    </userTask>
+
+    <serviceTask id="task_whisperx" name="WhisperX транскрибирует все MP3&#10;→ dataset.csv&#10;→ dataset_timed.csv&#10;→ dataset_speakers.csv">
+      <incoming>sf_t_transcription_to_whisperx</incoming>
+      <outgoing>sf_t_whisperx_to_annotate</outgoing>
+    </serviceTask>
+
+    <userTask id="task_annotate" name="Разметить CSV вручную&#10;(цель / приоритет / группа / is_training_sample)">
+      <incoming>sf_t_whisperx_to_annotate</incoming>
+      <outgoing>sf_t_annotate_to_train</outgoing>
+    </userTask>
+
+    <userTask id="task_train_models" name="Запустить обучение моделей">
+      <incoming>sf_t_annotate_to_train</incoming>
+      <outgoing>sf_t_train_to_parallel</outgoing>
+    </userTask>
+
+    <!-- Parallel training -->
+    <parallelGateway id="gw_train_split" name="">
+      <incoming>sf_t_train_to_parallel</incoming>
+      <outgoing>sf_t_to_bert</outgoing>
+      <outgoing>sf_t_to_classical</outgoing>
+    </parallelGateway>
+
+    <serviceTask id="task_finetune_bert" name="Fine-tune ruBERT">
+      <incoming>sf_t_to_bert</incoming>
+      <outgoing>sf_t_bert_done</outgoing>
+    </serviceTask>
+
+    <serviceTask id="task_train_classical" name="Обучить TF-IDF+SVM / RF / KNN">
+      <incoming>sf_t_to_classical</incoming>
+      <outgoing>sf_t_classical_done</outgoing>
+    </serviceTask>
+
+    <parallelGateway id="gw_train_join" name="">
+      <incoming>sf_t_bert_done</incoming>
+      <incoming>sf_t_classical_done</incoming>
+      <outgoing>sf_t_join_to_evaluate</outgoing>
+    </parallelGateway>
+
+    <userTask id="task_evaluate" name="Оценить метрики&#10;(accuracy, F1, confusion matrix)">
+      <incoming>sf_t_join_to_evaluate</incoming>
+      <outgoing>sf_t_evaluate_to_gw</outgoing>
+    </userTask>
+
+    <exclusiveGateway id="gw_metrics_ok" name="Метрики приемлемые?">
+      <incoming>sf_t_evaluate_to_gw</incoming>
+      <outgoing>sf_t_metrics_yes</outgoing>
+      <outgoing>sf_t_metrics_no</outgoing>
+    </exclusiveGateway>
+
+    <userTask id="task_analyze_errors" name="Анализ ошибок →&#10;доразметка данных">
+      <incoming>sf_t_metrics_no</incoming>
+      <outgoing>sf_t_errors_to_train</outgoing>
+    </userTask>
+
+    <userTask id="task_deploy" name="Развернуть модель в продакшн">
+      <incoming>sf_t_metrics_yes</incoming>
+      <outgoing>sf_t_deploy_to_corrections</outgoing>
+    </userTask>
+
+    <!-- Feedback loop: operator corrections -->
+    <userTask id="task_operator_correction" name="Операторы исправляют предсказания модели&#10;(система сохраняет исправления автоматически)">
+      <incoming>sf_t_deploy_to_corrections</incoming>
+      <outgoing>sf_t_corrections_to_gw</outgoing>
+    </userTask>
+
+    <exclusiveGateway id="gw_enough_corrections" name="Накоплено достаточно исправлений?">
+      <incoming>sf_t_corrections_to_gw</incoming>
+      <outgoing>sf_t_enough_yes</outgoing>
+      <outgoing>sf_t_enough_no</outgoing>
+    </exclusiveGateway>
+
+    <serviceTask id="task_retrain" name="Дообучить модель на новых данных">
+      <incoming>sf_t_enough_yes</incoming>
+      <outgoing>sf_t_retrain_to_evaluate</outgoing>
+    </serviceTask>
+
+    <endEvent id="end_training" name="Модель работает в продакшн">
+      <incoming>sf_t_enough_no</incoming>
+    </endEvent>
+
+    <!-- Sequence Flows -->
+    <sequenceFlow id="sf_t_start_to_transcription"  sourceRef="start_training"        targetRef="task_run_transcription"/>
+    <sequenceFlow id="sf_t_transcription_to_whisperx" sourceRef="task_run_transcription" targetRef="task_whisperx"/>
+    <sequenceFlow id="sf_t_whisperx_to_annotate"    sourceRef="task_whisperx"          targetRef="task_annotate"/>
+    <sequenceFlow id="sf_t_annotate_to_train"        sourceRef="task_annotate"          targetRef="task_train_models"/>
+    <sequenceFlow id="sf_t_train_to_parallel"        sourceRef="task_train_models"      targetRef="gw_train_split"/>
+    <sequenceFlow id="sf_t_to_bert"                  sourceRef="gw_train_split"         targetRef="task_finetune_bert"/>
+    <sequenceFlow id="sf_t_to_classical"             sourceRef="gw_train_split"         targetRef="task_train_classical"/>
+    <sequenceFlow id="sf_t_bert_done"                sourceRef="task_finetune_bert"     targetRef="gw_train_join"/>
+    <sequenceFlow id="sf_t_classical_done"           sourceRef="task_train_classical"   targetRef="gw_train_join"/>
+    <sequenceFlow id="sf_t_join_to_evaluate"         sourceRef="gw_train_join"          targetRef="task_evaluate"/>
+    <sequenceFlow id="sf_t_evaluate_to_gw"           sourceRef="task_evaluate"          targetRef="gw_metrics_ok"/>
+    <sequenceFlow id="sf_t_metrics_yes"              sourceRef="gw_metrics_ok"          targetRef="task_deploy">
+      <conditionExpression>metrics_ok == true</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_t_metrics_no"               sourceRef="gw_metrics_ok"          targetRef="task_analyze_errors">
+      <conditionExpression>metrics_ok == false</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_t_errors_to_train"          sourceRef="task_analyze_errors"    targetRef="task_train_models"/>
+    <sequenceFlow id="sf_t_deploy_to_corrections"    sourceRef="task_deploy"            targetRef="task_operator_correction"/>
+    <sequenceFlow id="sf_t_corrections_to_gw"        sourceRef="task_operator_correction" targetRef="gw_enough_corrections"/>
+    <sequenceFlow id="sf_t_enough_yes"               sourceRef="gw_enough_corrections"  targetRef="task_retrain">
+      <conditionExpression>corrections &gt;= threshold</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_t_enough_no"                sourceRef="gw_enough_corrections"  targetRef="end_training">
+      <conditionExpression>corrections &lt; threshold</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sf_t_retrain_to_evaluate"      sourceRef="task_retrain"           targetRef="task_evaluate"/>
+  </process>

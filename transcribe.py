@@ -23,6 +23,7 @@ Columns in all CSVs:
 import argparse
 import csv
 import os
+import signal
 import sys
 import time
 from datetime import timedelta
@@ -148,6 +149,7 @@ def transcribe_file(
     align_model,        # pre-loaded once before the loop, or None
     align_metadata,     # pre-loaded once before the loop, or None
     device: str,
+    diarize_timeout_sec: int = 300,
 ) -> tuple[str, str, str | None]:
     """
     Transcribe and optionally diarize a single audio file.
@@ -183,12 +185,22 @@ def transcribe_file(
         except Exception as align_exc:
             print(f"\n  [warn] alignment failed ({align_exc}), using unaligned segments")
 
-    # Step 3: diarize
+    # Step 3: diarize (with timeout to avoid hanging on long files)
+    def _timeout_handler(signum, frame):
+        raise TimeoutError("diarization timed out")
+
     try:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(diarize_timeout_sec)
         diarize_segments = diarize_pipeline(str(audio_path))
+        signal.alarm(0)  # cancel alarm
         result = whisperx.diarize.assign_word_speakers(diarize_segments, {"segments": segments})
         segments = result.get("segments", segments)
+    except TimeoutError:
+        signal.alarm(0)
+        print(f"\n  [warn] diarization timed out after {diarize_timeout_sec}s, speaker labels will be UNKNOWN")
     except Exception as diar_exc:
+        signal.alarm(0)
         print(f"\n  [warn] diarization failed ({diar_exc}), speaker labels will be UNKNOWN")
 
     speakers_text = segments_to_speakers_text(segments)
@@ -241,6 +253,11 @@ def main():
         "--hf-token", default=None,
         help="Hugging Face token for pyannote diarization. "
              "Can also be set via HF_TOKEN environment variable."
+    )
+    parser.add_argument(
+        "--diarize-timeout", type=int, default=300,
+        help="Max seconds to spend on diarization per file (default: 300). "
+             "Files that exceed this limit get UNKNOWN speaker labels."
     )
 
     args = parser.parse_args()
@@ -339,7 +356,8 @@ def main():
             try:
                 plain_text, timed_text, speakers_text = transcribe_file(
                     audio_path, model, args.language,
-                    diarize_pipeline, align_model, align_metadata, device
+                    diarize_pipeline, align_model, align_metadata, device,
+                    diarize_timeout_sec=args.diarize_timeout,
                 )
                 plain_writer.writerow(make_row(audio_path.name, plain_text))
                 timed_writer.writerow(make_row(audio_path.name, timed_text))

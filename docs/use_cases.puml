@@ -1,0 +1,111 @@
+@startuml use_cases
+!theme plain
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecaseBorderColor #2C7BB6
+skinparam usecaseBackgroundColor #EAF4FB
+skinparam actorBorderColor #333333
+skinparam arrowColor #555555
+skinparam packageBorderColor #AAAAAA
+skinparam packageBackgroundColor #FAFAFA
+
+title Система автоматической обработки звонков техподдержки\nUse-Case диаграмма
+
+' ─────────────────────────────────────────────
+' Actors
+' ─────────────────────────────────────────────
+actor "Клиент" as Client
+actor "Оператор\n1-й линии" as Operator
+actor "Администратор" as Admin
+actor "IP-телефония" as Telephony <<system>>
+actor "ML-сервис" as MLService <<system>>
+actor "Тикет-система" as TicketSystem <<system>>
+
+' ─────────────────────────────────────────────
+' Use Cases
+' ─────────────────────────────────────────────
+rectangle "Система обработки звонков техподдержки" {
+
+  package "Обработка входящего звонка" {
+    usecase "Совершить звонок\nв техподдержку" as UC_Call
+    usecase "Принять звонок" as UC_Answer
+    usecase "Записать аудио\n+ метаданные" as UC_Record
+    usecase "Передать аудио\nпо API" as UC_SendAPI
+    usecase "Транскрибировать\nаудио (WhisperX)" as UC_Transcribe
+    usecase "Классифицировать звонок\n(цель / приоритет / группа)" as UC_Classify
+    usecase "Сгенерировать\nсаммари звонка" as UC_Summarize
+    usecase "Завести заявку\nв тикет-системе" as UC_Ticket
+    usecase "Уведомить\nисполнителя" as UC_Notify
+    usecase "Просмотреть результат\nклассификации" as UC_Review
+    usecase "Подтвердить\nпредсказание" as UC_Confirm
+    usecase "Исправить предсказание\n(цель / приоритет / группа)" as UC_Correct
+    usecase "Сохранить исправление\nкак обучающий пример" as UC_SaveCorrection
+  }
+
+  package "Администрирование и ML" {
+    usecase "Выдать доступ\nпользователю" as UC_Access
+    usecase "Запустить транскрипцию\nдатасета (transcribe.py)" as UC_RunTranscribe
+    usecase "Разметить датасет\nвручную" as UC_Annotate
+    usecase "Обучить модель" as UC_Train
+    usecase "Дообучить модель\nна исправлениях" as UC_Retrain
+    usecase "Оценить метрики\nмодели" as UC_Evaluate
+    usecase "Развернуть модель\nв продакшн" as UC_Deploy
+    usecase "Настроить интеграции\n(телефония / тикеты)" as UC_Configure
+  }
+}
+
+' ─────────────────────────────────────────────
+' Actor → Use Case relations
+' ─────────────────────────────────────────────
+
+' Client
+Client --> UC_Call
+
+' Operator
+Operator --> UC_Answer
+Operator --> UC_Review
+Operator --> UC_Confirm
+Operator --> UC_Correct
+
+' Admin
+Admin --> UC_Access
+Admin --> UC_RunTranscribe
+Admin --> UC_Annotate
+Admin --> UC_Train
+Admin --> UC_Retrain
+Admin --> UC_Evaluate
+Admin --> UC_Deploy
+Admin --> UC_Configure
+
+' Systems
+Telephony --> UC_Record
+Telephony --> UC_SendAPI
+MLService  --> UC_Transcribe
+MLService  --> UC_Classify
+MLService  --> UC_Summarize
+MLService  --> UC_Ticket
+MLService  --> UC_SaveCorrection
+TicketSystem --> UC_Notify
+
+' ─────────────────────────────────────────────
+' Include / Extend relations
+' ─────────────────────────────────────────────
+
+UC_Call     ..> UC_Record      : <<include>>
+UC_Answer   ..> UC_Record      : <<include>>
+UC_SendAPI  ..> UC_Transcribe  : <<include>>
+UC_Transcribe ..> UC_Classify  : <<include>>
+UC_Classify ..> UC_Summarize   : <<include>>
+UC_Summarize ..> UC_Ticket     : <<include>>
+UC_Ticket   ..> UC_Notify      : <<include>>
+
+UC_Correct  ..> UC_SaveCorrection : <<include>>
+UC_SaveCorrection ..> UC_Retrain  : <<extend>>
+
+UC_RunTranscribe ..> UC_Annotate  : <<include>>
+UC_Annotate ..> UC_Train         : <<include>>
+UC_Train    ..> UC_Evaluate      : <<include>>
+UC_Evaluate ..> UC_Deploy        : <<extend>>
+UC_Retrain  ..> UC_Evaluate      : <<include>>
+
+@enduml
