@@ -69,16 +69,17 @@ EMAIL_RE = re.compile(
     r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}",
 )
 
-# Contract / ticket / order numbers: digit sequences of 5+ chars,
-# often preceded by a keyword
+# Contract / ticket / order numbers
+# NOTE: re.VERBOSE is intentionally NOT used here — Cyrillic inside verbose
+# patterns causes a PatternError in Python 3.12+
+_CONTRACT_KEYWORDS = "|".join([
+    "договор", "контракт", "тикет",
+    r"заявк[аи]", r"обращени[ея]",
+    "номер", "№", "#", "id",
+])
 CONTRACT_RE = re.compile(
-    r"""
-    (?:
-        (?:договор|контракт|тикет|заявк[аи]|обращени[ея]|номер|№|#|id)\s*
-    )
-    [\w\-\/]{3,}
-    """,
-    re.VERBOSE | re.IGNORECASE,
+    r"(?:(?:" + _CONTRACT_KEYWORDS + r")\s*)[\w\-\/]{3,}",
+    re.IGNORECASE,
 )
 
 # Standalone long digit sequences (card-like, INN, SNILS, passport fragments)
@@ -95,7 +96,7 @@ FILLERS = {
     "ну", "вот", "так", "это", "типа", "короче", "значит", "собственно",
     "ладно", "хорошо", "понятно", "слушайте", "слушай", "скажите", "скажи",
     "просто", "буквально", "вообще", "кстати", "кажется", "наверное",
-    "допустим", "предположим", "алло", "алё",
+    "допустим", "предположим", "алло", "алё", 
 }
 FILLERS_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in FILLERS) + r")\b",
@@ -129,6 +130,71 @@ PLACEHOLDER = {
 }
 
 
+# ── Common Russian first names for fallback regex-based redaction ────────────
+# WhisperX often outputs lowercase text which breaks NER — this list catches
+# names that Natasha misses due to missing capitalisation.
+_RUSSIAN_NAMES = {
+    # Male
+    "александр","алексей","андрей","антон","артём","артем","борис","вадим",
+    "валентин","валерий","василий","виктор","виталий","владимир","владислав",
+    "вячеслав","геннадий","георгий","григорий","даниил","денис","дмитрий",
+    "евгений","иван","игорь","илья","кирилл","константин","леонид","максим",
+    "михаил","никита","николай","олег","павел","пётр","петр","роман","руслан",
+    "сергей","степан","тимур","фёдор","федор","филипп","юрий","яков","ярослав",
+    # Female
+    "александра","алина","алла","анастасия","анна","валентина","валерия",
+    "вера","виктория","галина","дарья","диана","екатерина","елена","жанна",
+    "зинаида","инна","ирина","карина","кристина","ксения","лариса","людмила",
+    "маргарита","марина","мария","надежда","наталья","наталия","нина","оксана",
+    "ольга","полина","светлана","sofia","софия","тамара","татьяна","юлия",
+    # Short / diminutive forms commonly heard in calls
+    "саша","паша","вася","коля","миша","серёжа","серёга","женя","дима","лена",
+    "аня","оля","катя","таня","наташа","юля","маша","света","настя","даша",
+    "лёша","алёша","вова","игорёк","макс","рома","тёма","артёмка",
+}
+
+_NAMES_RE = re.compile(
+    r"\b(" + "|".join(re.escape(n) for n in sorted(_RUSSIAN_NAMES, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+# Common legal entity suffixes / org keywords for regex fallback
+# Pattern 1: юридическая форма + название  (ООО Ромашка, ИП Петров)
+_ORG_LEGAL_RE = re.compile(
+    r"\b(?:ооо|оао|зао|пао|ип|ао|нко|фгуп|мкп|гбу|гуп)"
+    r"\s+[«\"]?[А-ЯЁа-яё\w][\w\s\-«»\"]{1,40}[»\"]?",
+    re.IGNORECASE,
+)
+
+# Pattern 2: слово-триггер + 1-4 слова названия (в т.ч. аббревиатуры и кириллица)
+# Примеры: "компания Рога и Копыта", "фирма АСТРА", "организация ТехСервис Плюс"
+_ORG_TRIGGER_KEYWORDS = "|".join([
+    "компани[яи]", "компанию", "фирм[аы]", "фирму",
+    "организаци[яи]", "организацию",
+    "предприяти[яе]", "предприятию",
+    "работодател[ьея]",
+    "заказчик[аи]?", "клиент[аы]?",
+    "поставщик[аи]?", "подрядчик[аи]?",
+])
+_ORG_TRIGGER_RE = re.compile(
+    r"\b(?:" + _ORG_TRIGGER_KEYWORDS + r")\s+"
+    r"(?:[«\"]?)([А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z0-9\-]{0,30}"
+    r"(?:\s+[А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z0-9\-]{0,30}){0,3})"
+    r"(?:[»\"]?)",
+    re.IGNORECASE,
+)
+
+def _ORG_RE_sub(text: str) -> str:
+    """Apply both org patterns, replacing matched org names with placeholder."""
+    text = _ORG_LEGAL_RE.sub(PLACEHOLDER["ORG"], text)
+    # For trigger pattern keep the trigger word, replace only the name part
+    text = _ORG_TRIGGER_RE.sub(
+        lambda m: m.group(0).replace(m.group(1), PLACEHOLDER["ORG"]),
+        text,
+    )
+    return text
+
+
 # ── Natasha pipeline (loaded once) ──────────────────────────────────────────
 
 def _build_natasha():
@@ -143,28 +209,54 @@ def _build_natasha():
     }
 
 
+def _capitalize_for_ner(text: str) -> str:
+    """
+    Capitalise the first letter of each sentence so that Natasha NER
+    (trained on properly cased news text) can find named entities.
+    WhisperX often outputs fully lowercase transcriptions.
+    """
+    # Capitalise after sentence-ending punctuation or at start of string
+    result = re.sub(
+        r"((?:^|(?<=[.!?]))\s*)([а-яёa-z])",
+        lambda m: m.group(1) + m.group(2).upper(),
+        text,
+    )
+    return result
+
+
 def _ner_redact(text: str, nlp: dict) -> str:
-    """Replace named entities (PER, ORG, LOC) with placeholders using Natasha."""
-    doc = Doc(text)
+    """Replace named entities (PER, ORG, LOC) with placeholders using Natasha.
+
+    Works on a temporarily capitalised copy so NER fires correctly on
+    lowercase WhisperX output; replacements are applied back to original.
+    """
+    capped = _capitalize_for_ner(text)
+
+    doc = Doc(capped)
     doc.segment(nlp["segmenter"])
     doc.tag_morph(nlp["morph_tagger"])
     doc.tag_ner(nlp["ner_tagger"])
 
-    if not doc.spans:
-        return text
-
-    # Build redacted string by replacing spans from right to left
-    # (so offsets stay valid)
     spans = sorted(
         [s for s in doc.spans if s.type in NER_REDACT_TYPES],
         key=lambda s: s.start,
         reverse=True,
     )
+
+    # Apply replacements on the *original* text using the same offsets
+    # (safe because capitalisation only changes individual chars, not positions)
     chars = list(text)
     for span in spans:
         placeholder = PLACEHOLDER.get(span.type, "[СУЩНОСТЬ]")
         chars[span.start:span.stop] = list(placeholder)
     return "".join(chars)
+
+
+def _regex_fallback_redact(text: str) -> str:
+    """Catch names / orgs that Natasha missed using dictionary + pattern matching."""
+    text = _ORG_RE_sub(text)
+    text = _NAMES_RE.sub(PLACEHOLDER["PER"], text)
+    return text
 
 
 # ── PII cleaning ────────────────────────────────────────────────────────────
@@ -204,7 +296,7 @@ def normalize(text: str) -> str:
 
     # 4. Replace punctuation that doesn't carry sentence meaning
     #    Keep: letters, digits, spaces, hyphens inside words, placeholders []
-    text = re.sub(r"[\"\'«»„""\(\)\{\}\\|@#$%^&*=+<>~`]", " ", text)
+    text = re.sub(r'["\'«»„""\(\)\{\}\\|@#$%^&*=+<>~`]', " ", text)
 
     # 5. Collapse repeated characters (ааааа → аа, !!!! → !)
     text = REPEAT_CHARS_RE.sub(r"\1\1", text)
@@ -228,18 +320,20 @@ def process_text(text: str, nlp) -> str:
     if text.startswith("[TRANSCRIPTION_ERROR"):
         return text
 
-    # Step 1: Regex PII
+    # Step 1: Regex PII (phones, emails, URLs, contract numbers, long digits)
     text = remove_pii_regex(text)
 
-    # Step 2: NER PII (names, orgs, addresses)
+    # Step 2: NER PII via Natasha (works on capitalised copy internally)
     if nlp is not None:
         try:
             text = _ner_redact(text, nlp)
-        except Exception as exc:
-            # NER failure is non-fatal — log and continue
+        except Exception:
             pass
 
-    # Step 3: Normalize
+    # Step 3: Regex fallback — catches names/orgs Natasha missed on lowercase text
+    text = _regex_fallback_redact(text)
+
+    # Step 4: Normalize (lowercase happens here — must be AFTER all PII steps)
     text = normalize(text)
 
     return text
