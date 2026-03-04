@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """
-Dataset preparation script for ML training.
+Dataset preparation script for ML training (Russian call-center transcriptions).
 
 Steps applied to each text:
-  1. PII removal  — names, phones, emails, addresses, org names, job titles,
-                    contract/ticket numbers → replaced with [PLACEHOLDER] tokens
-  2. Normalization — unicode cleanup, whitespace, lowercasing, punctuation,
-                     repeated chars, filler words
-  3. Length filter — rows with too little text after cleaning are flagged
+  1. PII removal  — phones, emails, IPs, URLs, contract numbers
+                    → replaced with readable [PLACEHOLDER] tokens
+  2. NER redaction — person names, org names, locations via Stanza
+                     + pymorphy3 dictionary fallback for names
+  3. Normalization — unicode cleanup, lowercasing, whitespace collapse
+                     (punctuation and meaningful words are preserved)
+  4. Length filter — rows with too little text after cleaning are flagged
+
+Design principles for Russian transcription data:
+  - Punctuation inside text is kept (helps with sentence structure)
+  - Common Russian words (это, так, вот, хорошо...) are NOT removed —
+    they carry meaning in context ("это не работает", "так и не решили")
+  - Quotes are preserved — product names are often quoted («Арендата»)
+  - Only provably-PII patterns are replaced, not heuristic guesses
+  - Name redaction requires pymorphy3 NOM-form match to avoid false positives
+    on homonyms (вера/надежда as common nouns, виктор as adjective etc.)
 
 Usage:
     python prepare_dataset.py --input dataset.csv --output dataset_clean.csv
     python prepare_dataset.py --input dataset.csv --output dataset_clean.csv --min-tokens 5
 
+    # Re-run cleaning on already-cleaned file, starting from row 223 (0-based),
+    # reading source text from 'text_original' column:
+    python prepare_dataset.py --input dataset_clean.csv --output dataset_clean_v2.csv \\
+        --source-column text_original --start-row 223
+
 Dependencies:
-    pip install natasha pymorphy3 pandas tqdm
+    pip install stanza pymorphy3 pymorphy3-dicts-ru pandas tqdm
+    python -c "import stanza; stanza.download('ru')"
 """
 
 import argparse
@@ -26,64 +43,92 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-# ── Natasha (Russian NER) ────────────────────────────────────────────────────
+# ── Stanza (Russian NER) ─────────────────────────────────────────────────────
 try:
-    from natasha import (
-        Doc,
-        MorphVocab,
-        NewsEmbedding,
-        NewsMorphTagger,
-        NewsNERTagger,
-        Segmenter,
+    import stanza
+    from stanza import DownloadMethod
+    _nlp_stanza = stanza.Pipeline(
+        "ru",
+        processors="tokenize,ner",
+        download_method=DownloadMethod.REUSE_RESOURCES,
+        verbose=False,
     )
-    _NATASHA_OK = True
-except ImportError:
-    _NATASHA_OK = False
+    _STANZA_OK = True
+except Exception as e:
+    _STANZA_OK = False
+    _nlp_stanza = None
     print(
-        "Warning: natasha not installed. NER-based PII removal (names, orgs, "
-        "addresses) will be skipped.\nInstall: pip install natasha",
+        f"Warning: stanza not available ({e}).\n"
+        "NER-based PII removal will be skipped.\n"
+        'Install: pip install stanza && python -c "import stanza; stanza.download(\'ru\')"',
         file=sys.stderr,
     )
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── pymorphy3 (lemmatization for name dictionary lookup) ────────────────────
+try:
+    import pymorphy3
+    _morph = pymorphy3.MorphAnalyzer()
+    _MORPH_OK = True
+except ImportError:
+    _morph = None
+    _MORPH_OK = False
+    print(
+        "Warning: pymorphy3 not installed. Name lemmatization will be skipped.\n"
+        "Install: pip install pymorphy3 pymorphy3-dicts-ru",
+        file=sys.stderr,
+    )
 
-# Regex-based PII patterns (applied before NER)
+# ── PII regex patterns ───────────────────────────────────────────────────────
+
+# Standard phone: +7 999 123-45-67 / 8(999)123-45-67
+# Requires at least area code + 7 digits to avoid false positives on short numbers
 PHONE_RE = re.compile(
-    r"""
-    (?:
-        \+?7|8           # country code
-    )?
-    [\s\-\(]*
-    \d{3}                # area code
-    [\s\-\)]*
-    \d{3}
-    [\s\-]*
-    \d{2}
-    [\s\-]*
-    \d{2}
-    """,
-    re.VERBOSE,
+    r"(?:\+?7|8)[\s\-\(]*\d{3}[\s\-\)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}",
 )
 
+# Phone dictated digit by digit: "1-7-8-7-…" — min 7 digit tokens to reduce false positives
+# (e.g. "версия 2 0 0 1" only has 4 tokens → won't match)
+PHONE_DICTATED_DIGITS_RE = re.compile(
+    r"\b(?:\d[\s\-]){6,}\d\b",
+)
+
+# Phone dictated as Russian words: один два три ... (min 7 words)
+_DIGIT_WORDS = "ноль|один|два|три|четыре|пять|шесть|семь|восемь|девять"
+PHONE_DICTATED_WORDS_RE = re.compile(
+    r"\b(?:(?:" + _DIGIT_WORDS + r")[\s,\-]*){7,}",
+    re.IGNORECASE,
+)
+
+# Standard email
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}",
 )
 
-# Contract / ticket / order numbers
-# NOTE: re.VERBOSE is intentionally NOT used here — Cyrillic inside verbose
-# patterns causes a PatternError in Python 3.12+
-_CONTRACT_KEYWORDS = "|".join([
-    "договор", "контракт", "тикет",
-    r"заявк[аи]", r"обращени[ея]",
-    "номер", "№", "#", "id",
-])
-CONTRACT_RE = re.compile(
-    r"(?:(?:" + _CONTRACT_KEYWORDS + r")\s*)[\w\-\/]{3,}",
+# Email dictated letter by letter — explicit @ marker required
+EMAIL_DICTATED_RE = re.compile(
+    r"(?:[а-яёa-z](?:\s+(?:русская|латинская|заглавная|маленькая))?\s+){2,}"
+    r"(?:как\s+)?(?:собака|доллар|at|эт)"
+    r"(?:\s+[а-яёa-z]){1,}"
+    r"(?:\s+точка\s+[а-яёa-z]{2,4})?",
     re.IGNORECASE,
 )
 
-# Standalone long digit sequences (card-like, INN, SNILS, passport fragments)
-LONG_DIGITS_RE = re.compile(r"\b\d{6,}\b")
+# Contract / ticket numbers — keyword must immediately precede alphanumeric ID
+# Anchored tighter: keyword + optional whitespace + ID that starts with a digit or letter
+# "номер версии 2.0" won't match because "версии" ≠ keyword
+_CONTRACT_KEYWORDS = "|".join([
+    "договор[а-я]*", "контракт[а-я]*", "тикет[а-я]*",
+    r"заявк[аи]", r"обращени[ея]",
+    "номер", "№", r"#\s*(?=\w)", r"\bid\b",
+])
+CONTRACT_RE = re.compile(
+    r"(?:" + _CONTRACT_KEYWORDS + r")\s*[A-ZА-ЯЁa-zа-яё]?[\d][\w\-\/]{2,}",
+    re.IGNORECASE,
+)
+
+# Standalone long digit sequences — raised threshold to 8+ digits
+# 6-digit sequences hit version numbers, postal codes too often
+LONG_DIGITS_RE = re.compile(r"\b\d{8,}\b")
 
 # IP addresses
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -91,32 +136,22 @@ IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 # URLs
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 
-# Russian filler / parasite words that carry no semantic value
-FILLERS = {
-    "ну", "вот", "так", "это", "типа", "короче", "значит", "собственно",
-    "ладно", "хорошо", "понятно", "слушайте", "слушай", "скажите", "скажи",
-    "просто", "буквально", "вообще", "кстати", "кажется", "наверное",
-    "допустим", "предположим", "алло", "алё", 
-}
-FILLERS_RE = re.compile(
-    r"\b(" + "|".join(re.escape(w) for w in FILLERS) + r")\b",
-    re.IGNORECASE,
-)
-
-# Repeated chars (e.g. "ааааа", "!!!!")
+# Repeated chars (e.g. "ааааа", "!!!!") — collapse to max 2 repetitions
 REPEAT_CHARS_RE = re.compile(r"(.)\1{3,}")
 
-# Multiple spaces / newlines
+# Multiple spaces / newlines → single space
 WHITESPACE_RE = re.compile(r"\s+")
 
-# NER entity types to redact
-NER_REDACT_TYPES = {
-    "PER",   # persons
-    "ORG",   # organisations / company names
-    "LOC",   # locations / addresses
+# Stanza entity labels → placeholder keys
+STANZA_LABEL_MAP = {
+    "PER":    "PER",
+    "PERSON": "PER",
+    "ORG":    "ORG",
+    "LOC":    "LOC",
+    "GPE":    "LOC",
 }
 
-# Placeholder map
+# Placeholder tokens (human-readable, survive lowercasing in downstream steps)
 PLACEHOLDER = {
     "phone":    "[ТЕЛЕФОН]",
     "email":    "[EMAIL]",
@@ -130,64 +165,80 @@ PLACEHOLDER = {
 }
 
 
-# ── Common Russian first names for fallback regex-based redaction ────────────
-# WhisperX often outputs lowercase text which breaks NER — this list catches
-# names that Natasha misses due to missing capitalisation.
-_RUSSIAN_NAMES = {
+# ── Russian first names dictionary (nominative lemmas) ───────────────────────
+#
+# Intentionally includes homonyms (вера, надежда, виктория и т.д.):
+# в транскрипциях колл-центра слово почти всегда является именем, а не
+# нарицательным существительным. Ложное срабатывание (скрыть "надежда" в
+# редком философском контексте) менее опасно, чем пропустить реальное имя.
+#
+_RUSSIAN_NAME_LEMMAS = frozenset({
     # Male
-    "александр","алексей","андрей","антон","артём","артем","борис","вадим",
-    "валентин","валерий","василий","виктор","виталий","владимир","владислав",
-    "вячеслав","геннадий","георгий","григорий","даниил","денис","дмитрий",
-    "евгений","иван","игорь","илья","кирилл","константин","леонид","максим",
-    "михаил","никита","николай","олег","павел","пётр","петр","роман","руслан",
-    "сергей","степан","тимур","фёдор","федор","филипп","юрий","яков","ярослав",
+    "александр", "алексей", "андрей", "антон", "артём", "борис", "вадим",
+    "валентин", "валерий", "василий", "виктор", "виталий", "владимир",
+    "владислав", "вячеслав", "геннадий", "георгий", "григорий", "даниил",
+    "денис", "дмитрий", "евгений", "иван", "игорь", "илья", "кирилл",
+    "константин", "леонид", "максим", "михаил", "никита", "николай", "олег",
+    "павел", "пётр", "роман", "руслан", "сергей", "степан", "тимур", "фёдор",
+    "филипп", "юрий", "яков", "ярослав",
     # Female
-    "александра","алина","алла","анастасия","анна","валентина","валерия",
-    "вера","виктория","галина","дарья","диана","екатерина","елена","жанна",
-    "зинаида","инна","ирина","карина","кристина","ксения","лариса","людмила",
-    "маргарита","марина","мария","надежда","наталья","наталия","нина","оксана",
-    "ольга","полина","светлана","sofia","софия","тамара","татьяна","юлия",
-    # Short / diminutive forms commonly heard in calls
-    "саша","паша","вася","коля","миша","серёжа","серёга","женя","дима","лена",
-    "аня","оля","катя","таня","наташа","юля","маша","света","настя","даша",
-    "лёша","алёша","вова","игорёк","макс","рома","тёма","артёмка",
-}
+    "александра", "алина", "алла", "анастасия", "анна", "валентина",
+    "валерия", "вера", "виктория", "галина", "дарья", "диана", "екатерина",
+    "елена", "жанна", "зинаида", "инна", "ирина", "карина", "кристина",
+    "ксения", "лариса", "людмила", "маргарита", "марина", "мария", "надежда",
+    "наталья", "нина", "оксана", "ольга", "полина", "светлана", "софия",
+    "тамара", "татьяна", "юлия",
+    # Diminutives
+    "саша", "паша", "вася", "коля", "миша", "серёжа", "женя", "дима",
+    "лена", "аня", "оля", "катя", "таня", "наташа", "юля", "маша", "света",
+    "настя", "даша", "лёша", "вова", "макс", "рома",
+})
 
-_NAMES_RE = re.compile(
-    r"\b(" + "|".join(re.escape(n) for n in sorted(_RUSSIAN_NAMES, key=len, reverse=True)) + r")\b",
-    re.IGNORECASE,
-)
 
-# Common legal entity suffixes / org keywords for regex fallback
-# Pattern 1: юридическая форма + название  (ООО Ромашка, ИП Петров)
+def _is_name_lemma(word: str) -> bool:
+    """
+    True если лемма слова совпадает с именем из словаря.
+    Проверка идёт только по словарю — без фильтрации по тегу pymorphy3,
+    чтобы не пропускать имена-омонимы (вера, надежда и т.д.).
+    """
+    if not _MORPH_OK:
+        return word.lower() in _RUSSIAN_NAME_LEMMAS
+    parses = _morph.parse(word)
+    if not parses:
+        return False
+    return parses[0].normal_form in _RUSSIAN_NAME_LEMMAS
+
+
+# ── Org regex fallback ───────────────────────────────────────────────────────
+
+# Pattern 1: юридическая форма + название (ООО Ромашка, ИП Петров)
 _ORG_LEGAL_RE = re.compile(
     r"\b(?:ооо|оао|зао|пао|ип|ао|нко|фгуп|мкп|гбу|гуп)"
     r"\s+[«\"]?[А-ЯЁа-яё\w][\w\s\-«»\"]{1,40}[»\"]?",
     re.IGNORECASE,
 )
 
-# Pattern 2: слово-триггер + 1-4 слова названия (в т.ч. аббревиатуры и кириллица)
-# Примеры: "компания Рога и Копыта", "фирма АСТРА", "организация ТехСервис Плюс"
+# Pattern 2: триггер + название — только если название начинается с заглавной
+# (снижает ложные срабатывания на обычные фразы типа "компания хочет")
 _ORG_TRIGGER_KEYWORDS = "|".join([
     "компани[яи]", "компанию", "фирм[аы]", "фирму",
     "организаци[яи]", "организацию",
     "предприяти[яе]", "предприятию",
     "работодател[ьея]",
-    "заказчик[аи]?", "клиент[аы]?",
-    "поставщик[аи]?", "подрядчик[аи]?",
+    "заказчик[аи]?", "поставщик[аи]?", "подрядчик[аи]?",
+    r"холдинг(?:е|а|у|ом)?",
+    r"групп[аыу]",
 ])
 _ORG_TRIGGER_RE = re.compile(
     r"\b(?:" + _ORG_TRIGGER_KEYWORDS + r")\s+"
-    r"(?:[«\"]?)([А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z0-9\-]{0,30}"
-    r"(?:\s+[А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z0-9\-]{0,30}){0,3})"
-    r"(?:[»\"]?)",
-    re.IGNORECASE,
+    r"[«\"]?([А-ЯЁ][А-ЯЁа-яё0-9\-]{1,30}"        # ← starts with CAPITAL letter
+    r"(?:\s+[А-ЯЁа-яё0-9\-]{1,30}){0,3})"
+    r"[»\"]?",
 )
 
-def _ORG_RE_sub(text: str) -> str:
-    """Apply both org patterns, replacing matched org names with placeholder."""
+
+def _org_re_sub(text: str) -> str:
     text = _ORG_LEGAL_RE.sub(PLACEHOLDER["ORG"], text)
-    # For trigger pattern keep the trigger word, replace only the name part
     text = _ORG_TRIGGER_RE.sub(
         lambda m: m.group(0).replace(m.group(1), PLACEHOLDER["ORG"]),
         text,
@@ -195,165 +246,153 @@ def _ORG_RE_sub(text: str) -> str:
     return text
 
 
-# ── Natasha pipeline (loaded once) ──────────────────────────────────────────
+# ── Stanza NER redaction ─────────────────────────────────────────────────────
 
-def _build_natasha():
-    if not _NATASHA_OK:
-        return None
-    emb = NewsEmbedding()
-    return {
-        "segmenter":    Segmenter(),
-        "morph_vocab":  MorphVocab(),
-        "morph_tagger": NewsMorphTagger(emb),
-        "ner_tagger":   NewsNERTagger(emb),
-    }
-
-
-def _capitalize_for_ner(text: str) -> str:
+def _ner_redact_stanza(text: str) -> str:
     """
-    Capitalise the first letter of each sentence so that Natasha NER
-    (trained on properly cased news text) can find named entities.
-    WhisperX often outputs fully lowercase transcriptions.
+    Replace named entities (PER, ORG, LOC) using stanza wikiner-ru model.
+    Applied before lowercasing so capitalisation hints work properly.
+    Replacements applied right-to-left to keep offsets valid.
     """
-    # Capitalise after sentence-ending punctuation or at start of string
-    result = re.sub(
-        r"((?:^|(?<=[.!?]))\s*)([а-яёa-z])",
-        lambda m: m.group(1) + m.group(2).upper(),
-        text,
-    )
-    return result
+    doc = _nlp_stanza(text)
+    entities = []
+    for sent in doc.sentences:
+        for ent in sent.entities:
+            if ent.type in STANZA_LABEL_MAP:
+                entities.append((ent.start_char, ent.end_char, ent.type))
 
-
-def _ner_redact(text: str, nlp: dict) -> str:
-    """Replace named entities (PER, ORG, LOC) with placeholders using Natasha.
-
-    Works on a temporarily capitalised copy so NER fires correctly on
-    lowercase WhisperX output; replacements are applied back to original.
-    """
-    capped = _capitalize_for_ner(text)
-
-    doc = Doc(capped)
-    doc.segment(nlp["segmenter"])
-    doc.tag_morph(nlp["morph_tagger"])
-    doc.tag_ner(nlp["ner_tagger"])
-
-    spans = sorted(
-        [s for s in doc.spans if s.type in NER_REDACT_TYPES],
-        key=lambda s: s.start,
-        reverse=True,
-    )
-
-    # Apply replacements on the *original* text using the same offsets
-    # (safe because capitalisation only changes individual chars, not positions)
+    entities.sort(key=lambda e: e[0], reverse=True)
     chars = list(text)
-    for span in spans:
-        placeholder = PLACEHOLDER.get(span.type, "[СУЩНОСТЬ]")
-        chars[span.start:span.stop] = list(placeholder)
+    for start, end, label in entities:
+        ph = PLACEHOLDER.get(STANZA_LABEL_MAP[label], "[СУЩНОСТЬ]")
+        chars[start:end] = list(ph)
+    return "".join(chars)
+
+
+# ── pymorphy3 name fallback ──────────────────────────────────────────────────
+
+_WORD_RE = re.compile(r"[а-яёА-ЯЁ]{2,}")
+
+
+def _name_lemma_redact(text: str) -> str:
+    """
+    Walk every Cyrillic token and replace confirmed first names with [ИМЯ].
+    Requires pymorphy3 Name tag — avoids replacing homonym common nouns.
+    Applied right-to-left so character positions stay valid.
+    """
+    matches = list(_WORD_RE.finditer(text))
+    chars = list(text)
+    for m in reversed(matches):
+        if _is_name_lemma(m.group()):
+            chars[m.start():m.end()] = list(PLACEHOLDER["PER"])
     return "".join(chars)
 
 
 def _regex_fallback_redact(text: str) -> str:
-    """Catch names / orgs that Natasha missed using dictionary + pattern matching."""
-    text = _ORG_RE_sub(text)
-    text = _NAMES_RE.sub(PLACEHOLDER["PER"], text)
+    """Catch orgs / names that Stanza missed."""
+    text = _org_re_sub(text)
+    text = _name_lemma_redact(text)
     return text
 
 
-# ── PII cleaning ────────────────────────────────────────────────────────────
+# ── PII cleaning ─────────────────────────────────────────────────────────────
 
 def remove_pii_regex(text: str) -> str:
-    """Apply regex-based PII substitutions."""
     text = URL_RE.sub(PLACEHOLDER["url"], text)
     text = EMAIL_RE.sub(PLACEHOLDER["email"], text)
+    text = EMAIL_DICTATED_RE.sub(PLACEHOLDER["email"], text)
     text = PHONE_RE.sub(PLACEHOLDER["phone"], text)
+    text = PHONE_DICTATED_DIGITS_RE.sub(PLACEHOLDER["phone"], text)
+    text = PHONE_DICTATED_WORDS_RE.sub(PLACEHOLDER["phone"], text)
     text = IP_RE.sub(PLACEHOLDER["ip"], text)
-    text = CONTRACT_RE.sub(lambda m: PLACEHOLDER["contract"], text)
+    text = CONTRACT_RE.sub(PLACEHOLDER["contract"], text)
     text = LONG_DIGITS_RE.sub(PLACEHOLDER["digits"], text)
     return text
 
 
-# ── Text normalization ───────────────────────────────────────────────────────
+# ── Text normalization ────────────────────────────────────────────────────────
+#
+# What we do:
+#   • Unicode NFKC — canonical form, removes zero-width chars etc.
+#   • Strip Unicode control characters (category C*)
+#   • Lowercase
+#   • Collapse repeated characters (аааа → аа, !!!! → !!)
+#   • Collapse whitespace
+#
+# What we deliberately do NOT do:
+#   • Remove punctuation — commas, dots help with sentence boundaries
+#   • Remove «» quotes — product/company names are often quoted
+#   • Remove meaningful words (это, так, хорошо, понятно…) — they carry
+#     context in Russian ("это не работает" ≠ "не работает")
 
 def normalize(text: str) -> str:
-    """
-    Full normalization pipeline:
-      - Unicode NFKC normalization
-      - Strip non-printable chars
-      - Lowercase
-      - Remove/replace punctuation (keep sentence-meaningful ones)
-      - Collapse repeated characters
-      - Remove filler words
-      - Collapse whitespace
-    """
     # 1. Unicode normalization
     text = unicodedata.normalize("NFKC", text)
-
-    # 2. Remove non-printable / control characters
+    # 2. Strip control characters (but keep newlines → spaces below)
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
-
     # 3. Lowercase
     text = text.lower()
-
-    # 4. Replace punctuation that doesn't carry sentence meaning
-    #    Keep: letters, digits, spaces, hyphens inside words, placeholders []
-    text = re.sub(r'["\'«»„""\(\)\{\}\\|@#$%^&*=+<>~`]', " ", text)
-
-    # 5. Collapse repeated characters (ааааа → аа, !!!! → !)
+    # 4. Remove characters that are never meaningful in transcriptions
+    #    (technical symbols, not quotes/punctuation)
+    text = re.sub(r"[\\|@#$%^&*=+<>~`]", " ", text)
+    # 5. Collapse repeated characters: аааа → аа
     text = REPEAT_CHARS_RE.sub(r"\1\1", text)
-
-    # 6. Remove filler words
-    text = FILLERS_RE.sub(" ", text)
-
-    # 7. Collapse multiple spaces / newlines
+    # 6. Collapse whitespace
     text = WHITESPACE_RE.sub(" ", text).strip()
-
     return text
 
 
-# ── Full pipeline per row ────────────────────────────────────────────────────
+# ── Full pipeline per row ─────────────────────────────────────────────────────
 
-def process_text(text: str, nlp) -> str:
+def process_text(text: str, use_ner: bool) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
-
-    # Skip rows that already contain error markers from transcription
     if text.startswith("[TRANSCRIPTION_ERROR"):
         return text
 
-    # Step 1: Regex PII (phones, emails, URLs, contract numbers, long digits)
+    # Step 1: Regex PII — before NER so placeholders don't confuse the model
     text = remove_pii_regex(text)
 
-    # Step 2: NER PII via Natasha (works on capitalised copy internally)
-    if nlp is not None:
+    # Step 2: Stanza NER — must run BEFORE lowercasing (capitalisation matters)
+    if use_ner and _STANZA_OK:
         try:
-            text = _ner_redact(text, nlp)
-        except Exception:
-            pass
+            text = _ner_redact_stanza(text)
+        except Exception as exc:
+            print(f"Warning: Stanza failed on a row ({exc}), skipping NER for it.",
+                  file=sys.stderr)
 
-    # Step 3: Regex fallback — catches names/orgs Natasha missed on lowercase text
+    # Step 3: Regex + pymorphy3 fallback for names/orgs Stanza missed
     text = _regex_fallback_redact(text)
 
-    # Step 4: Normalize (lowercase happens here — must be AFTER all PII steps)
+    # Step 4: Normalize (lowercase + cleanup) — after NER
     text = normalize(text)
 
     return text
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Clean and normalize a transcription CSV for ML training."
+        description="Clean and normalize a Russian transcription CSV for ML training."
     )
     parser.add_argument("--input",  "-i", required=True,
                         help="Input CSV (e.g. dataset.csv)")
     parser.add_argument("--output", "-o", default=None,
                         help="Output CSV (default: <input>_clean.csv)")
     parser.add_argument("--min-tokens", type=int, default=3,
-                        help="Minimum token count after cleaning; "
-                             "shorter rows get flagged in 'too_short' column (default: 3)")
+                        help="Minimum token count after cleaning (default: 3)")
     parser.add_argument("--no-ner", action="store_true",
                         help="Skip NER-based PII removal (faster, but misses names/orgs)")
+    parser.add_argument("--source-column", default="text",
+                        help="Column to read source text from (default: text). "
+                             "Pass 'text_original' to re-clean from raw transcription.")
+    parser.add_argument("--start-row", type=int, default=0,
+                        help="0-based row index to start processing from (default: 0). "
+                             "Rows before this index are copied to output as-is.")
+    parser.add_argument("--sep", default=",",
+                        help="CSV field separator (default: comma). Use ';' for "
+                             "semicolon-delimited files.")
 
     args = parser.parse_args()
 
@@ -366,52 +405,83 @@ def main():
         sys.exit(1)
 
     print(f"Reading  : {input_path}")
-    df = pd.read_csv(input_path, dtype=str).fillna("")
+    df = pd.read_csv(input_path, sep=args.sep, dtype=str).fillna("")
 
     if "text" not in df.columns:
         print("Error: CSV must contain a 'text' column.", file=sys.stderr)
         sys.exit(1)
 
-    # Build NER pipeline once
-    nlp = None
-    if not args.no_ner:
-        print("Loading Natasha NER model (one-time, ~2s)...")
-        nlp = _build_natasha()
-        if nlp:
-            print("NER ready.")
+    src_col = args.source_column
+    if src_col not in df.columns:
+        print(f"Error: source column '{src_col}' not found in CSV. "
+              f"Available columns: {df.columns.tolist()}", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Processing {len(df)} rows...")
+    start_row = args.start_row
+    if start_row < 0 or start_row > len(df):
+        print(f"Error: --start-row {start_row} is out of range (0..{len(df)}).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    use_ner = not args.no_ner
+    if use_ner:
+        if _STANZA_OK:
+            print("Stanza NER ready (ru wikiner).")
+        else:
+            print("Warning: Stanza not available, NER skipped.", file=sys.stderr)
+    if _MORPH_OK:
+        print("pymorphy3 lemmatizer ready.")
+
+    n_total   = len(df)
+    n_skip    = start_row
+    n_process = n_total - n_skip
+
+    if n_skip > 0:
+        print(f"Rows 0..{n_skip - 1} ({n_skip} rows): kept as-is.")
+    print(f"Rows {n_skip}..{n_total - 1} ({n_process} rows): processing from '{src_col}'...")
     tqdm.pandas(desc="Cleaning")
 
-    df["text_original"] = df["text"]   # keep original for reference
-    df["text"] = df["text"].progress_apply(lambda t: process_text(t, nlp))
+    if "text_original" not in df.columns:
+        df["text_original"] = ""
 
-    # Flag rows that are too short after cleaning
-    df["too_short"] = df["text"].apply(
-        lambda t: len(t.split()) < args.min_tokens
-        if not t.startswith("[TRANSCRIPTION_ERROR")
-        else False
+    df.loc[df.index[start_row:], "text_original"] = df.loc[df.index[start_row:], src_col]
+
+    df.loc[df.index[start_row:], "text"] = (
+        df.loc[df.index[start_row:], src_col]
+        .progress_apply(lambda t: process_text(t, use_ner))
     )
 
-    n_short   = df["too_short"].sum()
-    n_errors  = df["text"].str.startswith("[TRANSCRIPTION_ERROR").sum()
-    n_empty   = (df["text"] == "").sum()
-    n_ok      = len(df) - n_short - n_errors - n_empty
+    if "too_short" not in df.columns:
+        df["too_short"] = ""
 
-    df.to_csv(output_path, index=False, encoding="utf-8")
+    df.loc[df.index[start_row:], "too_short"] = df.loc[df.index[start_row:], "text"].apply(
+        lambda t: str(len(t.split()) < args.min_tokens)
+        if not t.startswith("[TRANSCRIPTION_ERROR")
+        else "False"
+    )
+
+    n_short  = (df.loc[df.index[start_row:], "too_short"] == "True").sum()
+    n_errors = df.loc[df.index[start_row:], "text"].str.startswith("[TRANSCRIPTION_ERROR").sum()
+    n_empty  = (df.loc[df.index[start_row:], "text"] == "").sum()
+    n_ok     = n_process - n_short - n_errors - n_empty
+
+    df.to_csv(output_path, index=False, encoding="utf-8", sep=args.sep)
 
     print(f"\n{'─'*50}")
     print(f"Done. Output : {output_path}")
     print(f"{'─'*50}")
-    print(f"  Total rows        : {len(df)}")
-    print(f"  Clean & ready     : {n_ok}")
-    print(f"  Too short (<{args.min_tokens} tok): {n_short}  ← review 'too_short' column")
-    print(f"  Empty after clean : {n_empty}")
-    print(f"  Transcription err : {n_errors}")
+    print(f"  Total rows        : {n_total}")
+    print(f"  Skipped (kept)    : {n_skip}  (rows 0..{n_skip - 1})" if n_skip else
+          f"  Skipped (kept)    : 0")
+    print(f"  Processed         : {n_process}")
+    print(f"    Clean & ready   : {n_ok}")
+    print(f"    Too short (<{args.min_tokens} tok): {n_short}  ← review 'too_short' column")
+    print(f"    Empty after clean: {n_empty}")
+    print(f"    Transcription err: {n_errors}")
     print(f"{'─'*50}")
     if n_short > 0:
         print("Tip: filter out too-short rows before training:")
-        print("     df = df[~df['too_short']]")
+        print("     df = df[~df['too_short'].astype(str).str.lower().eq('true')]")
 
 
 if __name__ == "__main__":
