@@ -21,7 +21,9 @@ Usage:
 
 import argparse
 import json
+import re
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -36,17 +38,74 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.preprocessing import MaxAbsScaler
 from sklearn.svm import LinearSVC
 from sklearn.utils.class_weight import compute_class_weight
 
 warnings.filterwarnings("ignore")
 
-TARGETS = ["call_purpose", "priority", "assigned_group"]
+TARGETS = ["call_purpose", "priority", "assig_group"]
 SEP = ";"  # CSV separator — change to "," if needed
 MIN_SAMPLES_PER_CLASS = 5  # classes with fewer examples are dropped
+TEST_SIZE = 0.2            # доля данных в hold-out тесте (20%)
+
+# ── Keyword feature engineering ───────────────────────────────────────────────
+#
+# Явные маркеры классов — помогают модели различить consulting и license
+# когда TF-IDF не справляется из-за похожего словаря.
+#
+# Принцип: если слово точно указывает на класс — добавляем как отдельный признак.
+# Слова подобраны по реальным примерам из датасета.
+
+_COMMERCIAL_KEYWORDS = re.compile(
+    r"\b(?:"
+    r"стоимост[ьи]|цен[ауе]|прайс|лицензи[яию]|лицензирован\w+"
+    r"|купить|приобрести|закупк[аи]|бюджет\w*"
+    r"|коммерческ\w+|предложени[яе]|прайс.?лист"
+    r"|менеджер\w*\s+(?:по\s+)?продаж\w+"
+    r"|отдел\s+продаж|тендер\w*|договор\w*"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_TECHNICAL_KEYWORDS = re.compile(
+    r"\b(?:"
+    r"установ\w+|настро\w+|развернуть|деплой\w*|конфигур\w+"
+    r"|ошибк[аи]|баг\w*|верси[яию]|кластер\w*|нод[аы]"
+    r"|питон|python|ansible|docker|linux|bash|shell"
+    r"|adcm|adh|adpg|adb|арендата\s+дб"
+    r"|не\s+работает|не\s+запускается|не\s+подключается|упал\w*"
+    r"|логи|дебаг\w*|трейс\w*|стектрейс\w*"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+class KeywordFeaturesTransformer(BaseEstimator, TransformerMixin):
+    """
+    Добавляет два числовых признака поверх TF-IDF:
+      - has_commercial : 1 если текст содержит коммерческие маркеры (→ license)
+      - has_technical  : 1 если текст содержит технические маркеры  (→ consulting)
+
+    Признаки масштабируются MaxAbsScaler перед конкатенацией с TF-IDF,
+    чтобы их вес был сопоставим с TF-IDF значениями.
+    """
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        has_commercial = np.array(
+            [1.0 if _COMMERCIAL_KEYWORDS.search(t) else 0.0 for t in X]
+        ).reshape(-1, 1)
+        has_technical = np.array(
+            [1.0 if _TECHNICAL_KEYWORDS.search(t) else 0.0 for t in X]
+        ).reshape(-1, 1)
+        return np.hstack([has_commercial, has_technical])
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -89,13 +148,13 @@ def build_pipelines() -> dict[str, Pipeline]:
         ngram_range=(1, 2),
         max_features=15000,
         sublinear_tf=True,
-        min_df=2,
+        min_df=1,
     )
     return {
-        "TF-IDF + SVM": Pipeline([
-            ("tfidf", TfidfVectorizer(**tfidf)),
-            ("clf",   LinearSVC(max_iter=2000, class_weight="balanced")),
-        ]),
+        # GridSearchCV автоматически подбирает лучший C и ngram_range на train-fold'ах
+        "TF-IDF + SVM": _build_svm_grid(tfidf),
+        # TF-IDF + явные keyword-признаки + SVM
+        "TF-IDF + Keywords + SVM": _build_svm_keywords_grid(tfidf),
         "TF-IDF + RandomForest": Pipeline([
             ("tfidf", TfidfVectorizer(**tfidf)),
             ("clf",   RandomForestClassifier(
@@ -112,54 +171,151 @@ def build_pipelines() -> dict[str, Pipeline]:
     }
 
 
+def _build_svm_grid(tfidf_params: dict) -> GridSearchCV:
+    """
+    SVM с автоподбором гиперпараметров через GridSearchCV.
+
+    Перебирает комбинации:
+      C            — регуляризация (меньше = мягче граница)
+      ngram_range  — учитывать ли биграммы и триграммы
+      min_df       — минимальная частота слова
+
+    Подбор идёт на train-части через 5-fold CV, тест не трогается.
+    """
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(**tfidf_params)),
+        ("clf",   LinearSVC(max_iter=3000, class_weight="balanced")),
+    ])
+    param_grid = {
+        "clf__C":              [0.1, 0.3, 0.5, 1.0, 3.0],
+        "tfidf__ngram_range":  [(1, 1), (1, 2), (1, 3)],
+        "tfidf__min_df":       [1, 2],
+    }
+    return GridSearchCV(
+        pipeline,
+        param_grid,
+        scoring="f1_weighted",
+        cv=5,
+        n_jobs=-1,
+        refit=True,   # после подбора переобучает на всём train с лучшими параметрами
+        verbose=0,
+    )
+
+
+def _build_svm_keywords_grid(tfidf_params: dict) -> GridSearchCV:
+    """
+    SVM с TF-IDF + keyword-признаками.
+
+    FeatureUnion конкатенирует:
+      - TF-IDF матрицу (sparse)
+      - 2 числовых признака из KeywordFeaturesTransformer
+
+    MaxAbsScaler масштабирует keyword-признаки чтобы их вес
+    был сопоставим с TF-IDF значениями.
+    """
+    pipeline = Pipeline([
+        ("features", FeatureUnion([
+            ("tfidf",    TfidfVectorizer(**tfidf_params)),
+            ("keywords", KeywordFeaturesTransformer()),
+        ])),
+        ("clf", LinearSVC(max_iter=3000, class_weight="balanced")),
+    ])
+    param_grid = {
+        "clf__C":                          [0.1, 0.3, 0.5, 1.0, 3.0],
+        "features__tfidf__ngram_range":    [(1, 1), (1, 2), (1, 3)],
+        "features__tfidf__min_df":         [1, 2],
+    }
+    return GridSearchCV(
+        pipeline,
+        param_grid,
+        scoring="f1_weighted",
+        cv=5,
+        n_jobs=-1,
+        refit=True,
+        verbose=0,
+    )
+
+
+def _pipeline_params(pipeline) -> dict:
+    """Извлечь параметры пайплайна. Поддерживает GridSearchCV и обычный Pipeline."""
+    if isinstance(pipeline, GridSearchCV):
+        return {
+            "best_params": {k: str(v) for k, v in pipeline.best_params_.items()},
+            "best_cv_score": round(pipeline.best_score_, 4),
+        }
+    params = {}
+    for step_name, step in pipeline.steps:
+        step_params = step.get_params()
+        params[step_name] = {k: str(v) for k, v in step_params.items()}
+    return params
+
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate(name: str, pipeline: Pipeline,
-             X: pd.Series, y: pd.Series,
+             X_train: pd.Series, y_train: pd.Series,
+             X_test: pd.Series,  y_test: pd.Series,
              output_dir: Path) -> dict:
-    """Cross-validate, fit on full data, save model + confusion matrix."""
+    """Cross-validate on train, evaluate on hold-out test, save model + confusion matrix."""
 
     print(f"\n  [{name}]")
 
-    # Cross-validation (stratified 5-fold)
-    n_splits = min(5, y.value_counts().min())
-    if n_splits < 2:
-        print("    Not enough samples for CV — skipping cross-validation.")
-        cv_scores = np.array([0.0])
+    is_grid = isinstance(pipeline, GridSearchCV)
+
+    if is_grid:
+        # GridSearchCV сам делает CV внутри при fit()
+        pipeline.fit(X_train, y_train)
+        best_score = pipeline.best_score_
+        cv_scores = np.array([best_score])
+        print(f"    Best params : {pipeline.best_params_}")
+        print(f"    Best CV F1  (train, weighted): {best_score:.3f}")
     else:
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(
-            pipeline, X, y, cv=cv, scoring="f1_weighted", n_jobs=-1
-        )
-        print(f"    CV F1 (weighted): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+        # Обычный Pipeline — CV отдельно, потом fit на всём train
+        n_splits = min(5, y_train.value_counts().min())
+        if n_splits < 2:
+            print("    Not enough samples for CV — skipping cross-validation.")
+            cv_scores = np.array([0.0])
+        else:
+            cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            cv_scores = cross_val_score(
+                pipeline, X_train, y_train, cv=cv, scoring="f1_weighted", n_jobs=-1
+            )
+            print(f"    CV F1  (train, weighted): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+        pipeline.fit(X_train, y_train)
 
-    # Fit on full dataset
-    pipeline.fit(X, y)
-
-    # Training-set metrics (for reference)
-    y_pred = pipeline.predict(X)
-    train_f1 = f1_score(y, y_pred, average="weighted", zero_division=0)
-    print(f"    Train F1 (weighted): {train_f1:.3f}")
+    # Честная оценка на hold-out тесте
+    y_pred_test = pipeline.predict(X_test)
+    test_f1 = f1_score(y_test, y_pred_test, average="weighted", zero_division=0)
+    print(f"    Test F1 (hold-out, weighted): {test_f1:.3f}  ← честная оценка")
     print()
-    print(classification_report(y, y_pred, zero_division=0))
+    print(classification_report(y_test, y_pred_test, zero_division=0))
 
-    # Confusion matrix
-    labels = sorted(y.unique())
-    cm = confusion_matrix(y, y_pred, labels=labels)
+    # Confusion matrix по тестовой выборке
+    labels = sorted(y_test.unique())
+    cm = confusion_matrix(y_test, y_pred_test, labels=labels)
     _save_confusion_matrix(cm, labels, name, output_dir)
 
-    # Save model
+    # Сохранить модель (для GridSearchCV сохраняем best_estimator_)
     safe_name = name.replace(" ", "_").replace("+", "plus").replace("/", "-")
     model_path = output_dir / f"{safe_name}.joblib"
-    joblib.dump(pipeline, model_path)
+    save_obj = pipeline.best_estimator_ if is_grid else pipeline
+    joblib.dump(save_obj, model_path)
     print(f"    Saved: {model_path.name}")
 
+    # Подробный classification report по классам (для лога)
+    report_dict = classification_report(
+        y_test, y_pred_test, zero_division=0, output_dict=True
+    )
+
     return {
-        "model": name,
-        "cv_f1_mean": round(float(cv_scores.mean()), 4),
-        "cv_f1_std":  round(float(cv_scores.std()), 4),
-        "train_f1":   round(train_f1, 4),
-        "model_path": str(model_path),
+        "model":            name,
+        "cv_f1_mean":       round(float(cv_scores.mean()), 4),
+        "cv_f1_std":        round(float(cv_scores.std()), 4),
+        "cv_f1_folds":      [round(float(s), 4) for s in cv_scores],
+        "test_f1":          round(test_f1, 4),
+        "model_path":       str(model_path),
+        "params":           _pipeline_params(pipeline),
+        "per_class_report": report_dict,
     }
 
 
@@ -189,7 +345,9 @@ def _print_class_distribution(y: pd.Series):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_target(csv_path: Path, target: str, output_dir: Path):
+def run_target(csv_path: Path, target: str, output_dir: Path,
+               run_meta: dict) -> list[dict]:
+    """Обучает все модели для одного таргета. Возвращает список результатов."""
     print(f"\n{'═' * 60}")
     print(f"  TARGET: {target}")
     print(f"{'═' * 60}")
@@ -201,17 +359,29 @@ def run_target(csv_path: Path, target: str, output_dir: Path):
         X, y = load_data(csv_path, target)
     except ValueError as e:
         print(f"  Skipping: {e}")
-        return
+        return []
 
-    print(f"  Samples : {len(X)}")
+    class_dist = y.value_counts().to_dict()
+    print(f"  Всего samples : {len(X)}")
     _print_class_distribution(y)
+
+    # Hold-out split 80/20, стратифицированный по классам
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=42, stratify=y
+    )
+    print(f"\n  Train : {len(X_train)} | Test (hold-out) : {len(X_test)}")
 
     pipelines = build_pipelines()
     results = []
 
     for name, pipeline in pipelines.items():
         try:
-            result = evaluate(name, pipeline, X, y, target_dir)
+            result = evaluate(name, pipeline, X_train, y_train, X_test, y_test, target_dir)
+            result["target"]        = target
+            result["n_total"]       = len(X)
+            result["n_train"]       = len(X_train)
+            result["n_test"]        = len(X_test)
+            result["class_dist"]    = {str(k): int(v) for k, v in class_dist.items()}
             results.append(result)
         except Exception as exc:
             print(f"  ERROR training {name}: {exc}")
@@ -220,16 +390,30 @@ def run_target(csv_path: Path, target: str, output_dir: Path):
     if results:
         print(f"\n  {'─' * 50}")
         print(f"  Summary for '{target}':")
-        print(f"  {'Model':<30} {'CV F1':>8} {'±':>6} {'Train F1':>10}")
+        print(f"  {'Model':<30} {'CV F1':>8} {'±':>6} {'Test F1':>10}")
         print(f"  {'─' * 50}")
-        for r in sorted(results, key=lambda x: x["cv_f1_mean"], reverse=True):
-            print(f"  {r['model']:<30} {r['cv_f1_mean']:>8.3f} {r['cv_f1_std']:>6.3f} {r['train_f1']:>10.3f}")
+        for r in sorted(results, key=lambda x: x["test_f1"], reverse=True):
+            print(f"  {r['model']:<30} {r['cv_f1_mean']:>8.3f} {r['cv_f1_std']:>6.3f} {r['test_f1']:>10.3f}")
 
-        # Save results JSON
-        results_path = target_dir / "results.json"
-        with open(results_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"\n  Results saved to: {results_path}")
+        # Подробный лог для этого таргета
+        target_log = {
+            "run": run_meta,
+            "target": target,
+            "data": {
+                "n_total":    len(X),
+                "n_train":    len(X_train),
+                "n_test":     len(X_test),
+                "test_size":  TEST_SIZE,
+                "class_dist": {str(k): int(v) for k, v in class_dist.items()},
+            },
+            "models": results,
+        }
+        log_path = target_dir / "run_log.json"
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(target_log, f, ensure_ascii=False, indent=2)
+        print(f"\n  Full log saved to : {log_path}")
+
+    return results
 
 
 def main():
@@ -259,9 +443,43 @@ def main():
         print(f"Error: file '{csv_path}' not found.")
         return
 
+    # Метаинформация о запуске — пишется в каждый лог
+    run_meta = {
+        "timestamp":         datetime.now().isoformat(timespec="seconds"),
+        "input_file":        str(csv_path),
+        "output_dir":        str(output_dir),
+        "min_samples_class": MIN_SAMPLES_PER_CLASS,
+        "test_size":         TEST_SIZE,
+        "random_state":      42,
+    }
+
     targets = TARGETS if args.target == "all" else [args.target]
+    all_results = []
     for target in targets:
-        run_target(csv_path, target, output_dir)
+        results = run_target(csv_path, target, output_dir, run_meta)
+        all_results.extend(results)
+
+    # Сводный лог всего запуска
+    if all_results:
+        summary = {
+            "run": run_meta,
+            "summary": [
+                {
+                    "target":       r["target"],
+                    "model":        r["model"],
+                    "cv_f1_mean":   r["cv_f1_mean"],
+                    "cv_f1_std":    r["cv_f1_std"],
+                    "test_f1":      r["test_f1"],
+                    "n_train":      r["n_train"],
+                    "n_test":       r["n_test"],
+                }
+                for r in sorted(all_results, key=lambda x: (x["target"], -x["test_f1"]))
+            ],
+        }
+        summary_path = output_dir / "summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"\n  Сводный лог : {summary_path}")
 
     print(f"\n{'═' * 60}")
     print(f"  Done. Models and plots saved to: {output_dir}")
