@@ -19,8 +19,7 @@ sentence-transformers       # SBERT (paraphrase-multilingual-MiniLM-L12-v2)
 transformers
 accelerate                  # ускорение HuggingFace обучения
 
-## LLM zero/few-shot (секция 3.3.3)
-openai                      # OpenAI API и Ollama-совместимые эндпоинты
+## LLM zero/few-shot (секция 3.3.3) — использует urllib из stdlib, пакеты не нужны
 
 ## Подготовка датасета
 stanza

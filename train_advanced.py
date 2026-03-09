@@ -18,7 +18,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
     pip install gensim                                    # Word2Vec/Doc2Vec/fastText
     pip install sentence-transformers                     # SBERT
     pip install transformers torch accelerate             # RuBERT/XLM-RoBERTa
-    pip install openai                                    # LLM API (OpenAI / Ollama)
+    # LLM API использует urllib из стандартной библиотеки — дополнительных пакетов не нужно
 
 Запуск:
     # Только базовые модели (быстро, без GPU):
@@ -963,16 +963,28 @@ def _few_shot_prompt(
 def _call_llm(
     prompt: str, api_base: str, api_key: str, model: str, max_tokens: int = 50
 ) -> Optional[str]:
+    """HTTP-вызов OpenAI-совместимого API (Ollama, LM Studio и др.).
+    Использует только стандартную библиотеку — пакет openai не нужен.
+    """
+    import json as _json
+    import urllib.request
+
+    url     = api_base.rstrip("/") + "/chat/completions"
+    payload = _json.dumps({
+        "model":       model,
+        "messages":    [{"role": "user", "content": prompt}],
+        "max_tokens":  max_tokens,
+        "temperature": 0.0,
+    }).encode("utf-8")
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {api_key or 'ollama'}",
+    }
     try:
-        from openai import OpenAI
-        client = OpenAI(base_url=api_base, api_key=api_key or "ollama")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.0,
-        )
-        return resp.choices[0].message.content.strip()
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = _json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"].strip()
     except Exception as exc:
         print(f"      [API error] {exc}", file=sys.stderr)
         return None
@@ -1016,9 +1028,7 @@ def run_llm_models(
     print(f"  3.3.3  LLM ({llm_model}) — zero-shot / few-shot")
     print(f"{'═' * 60}")
 
-    if not _pkg_available("openai"):
-        print("  ПРОПУСК — пакет 'openai' не установлен. Установка: pip install openai")
-        return
+    # openai-пакет не нужен — используем urllib из стандартной библиотеки
 
     label_names = sorted(y_test.unique())
 
