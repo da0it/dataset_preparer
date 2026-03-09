@@ -1,2 +1,28 @@
+## Транскрипция (оригинальные зависимости)
 whisperx
 torch
+
+## Базовый ML (секция 3.2)
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+joblib
+tqdm
+
+## Эмбеддинги (секция 3.3.1)
+gensim                      # Word2Vec, Doc2Vec, fastText
+sentence-transformers       # SBERT (paraphrase-multilingual-MiniLM-L12-v2)
+
+## Трансформеры / fine-tuning (секция 3.3.2)
+transformers
+accelerate                  # ускорение HuggingFace обучения
+
+## LLM zero/few-shot (секция 3.3.3)
+openai                      # OpenAI API и Ollama-совместимые эндпоинты
+
+## Подготовка датасета
+stanza
+pymorphy3
+pymorphy3-dicts-ru

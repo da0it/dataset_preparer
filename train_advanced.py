@@ -1,0 +1,1359 @@
+#!/usr/bin/env python3
+"""
+train_advanced.py — Полный пайплайн ML/DL классификации транскриптов звонков.
+
+Секция 3.2  Базовые алгоритмы ML
+    Векторизаторы : Bag-of-Words (CountVectorizer), TF-IDF, N-gram TF-IDF
+    Классификаторы: Logistic Regression, SVM, Naive Bayes, Random Forest
+
+Секция 3.3  Нейросетевые модели
+  3.3.1 Эмбеддинги : Word2Vec, Doc2Vec, fastText, SentenceTransformers (SBERT)
+  3.3.2 Трансформеры: RuBERT, XLM-RoBERTa (fine-tuning)
+  3.3.3 LLM        : zero-shot, few-shot (OpenAI-совместимый API / Ollama)
+
+Секция 3.4  Сравнительный анализ — таблица метрик + графики
+
+Зависимости (устанавливать по мере необходимости):
+    pip install scikit-learn pandas numpy matplotlib seaborn joblib tqdm
+    pip install gensim                                    # Word2Vec/Doc2Vec/fastText
+    pip install sentence-transformers                     # SBERT
+    pip install transformers torch accelerate             # RuBERT/XLM-RoBERTa
+    pip install openai                                    # LLM API (OpenAI / Ollama)
+
+Запуск:
+    # Только базовые модели (быстро, без GPU):
+    python train_advanced.py -i dataset_clean.csv -g baseline
+
+    # Базовые + эмбеддинги:
+    python train_advanced.py -i dataset_clean.csv -g baseline,embeddings
+
+    # Трансформеры с GPU + fp16 (≈2–3× быстрее):
+    python train_advanced.py -i dataset_clean.csv -g baseline,rubert,xlmr --epochs 3 --fp16
+
+    # Полная модель RuBERT (лучше качество, нужен GPU ≥ 8 GB):
+    python train_advanced.py -i dataset_clean.csv -g rubert --fp16 \\
+        --rubert-model DeepPavlov/rubert-base-cased --batch-size 32
+
+    # bf16 + gradient accumulation (Ampere+, eff. batch = 16×4 = 64):
+    python train_advanced.py -i dataset_clean.csv -g rubert,xlmr \\
+        --bf16 --batch-size 16 --grad-accum 4
+
+    # LLM через Ollama:
+    python train_advanced.py -i dataset_clean.csv -g llm \\
+        --llm-api-base http://localhost:11434/v1 --llm-model llama3
+
+    # Всё сразу, все таргеты:
+    python train_advanced.py -i dataset_clean.csv -g all -t all --fp16
+"""
+
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
+
+import argparse
+import json
+import sys
+import time
+import warnings
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import ComplementNB, MultinomialNB
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import LinearSVC
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+TARGETS = ["call_purpose", "priority", "assig_group"]
+SEP = ";"
+MIN_SAMPLES_PER_CLASS = 5
+TEST_SIZE = 0.2
+
+RESOURCE_MAP = {
+    "baseline":     "низкие",
+    "embeddings":   "средние",
+    "transformers": "высокие",
+    "llm":          "очень высокие",
+}
+
+
+def print_gpu_info() -> None:
+    """Выводит информацию о доступном GPU при запуске."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print("  GPU: не обнаружен — используется CPU")
+            return
+        idx   = torch.cuda.current_device()
+        name  = torch.cuda.get_device_name(idx)
+        props = torch.cuda.get_device_properties(idx)
+        vram  = props.total_memory / 1024 ** 3
+        print(f"  GPU : {name}")
+        print(f"  VRAM: {vram:.1f} GB  |  CUDA {torch.version.cuda}"
+              f"  |  PyTorch {torch.__version__}")
+        # Совет зависит от объёма VRAM и поколения GPU
+        cap = props.major  # compute capability major version
+        if vram >= 12 and cap >= 9:  # Blackwell (9.x) или Ada (8.9)
+            print("  Совет (Blackwell/Ada, ≥12 GB): "
+                  "--bf16 --batch-size 32 --compile "
+                  "--rubert-model DeepPavlov/rubert-base-cased")
+        elif vram >= 12:             # Ampere/Turing с большим VRAM
+            print("  Совет (≥12 GB VRAM): "
+                  "--fp16 --batch-size 32 "
+                  "--rubert-model DeepPavlov/rubert-base-cased")
+        elif vram >= 8:
+            print("  Совет (8–11 GB VRAM): --fp16 --batch-size 16 --grad-accum 2")
+        else:
+            print("  Совет (< 8 GB): --fp16 --batch-size 8 --grad-accum 4")
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# DATA LOADING
+# ==============================================================================
+
+def load_data(csv_path: Path, target: str, sep: str = ";"):
+    """Load CSV, keep only training samples, drop empty/rare classes."""
+    df = pd.read_csv(csv_path, sep=sep, dtype=str).fillna("")
+
+    if "is_training_sample" in df.columns:
+        df = df[df["is_training_sample"].str.strip() == "1"]
+
+    df = df[df["text"].str.strip() != ""]
+    df = df[df[target].str.strip() != ""]
+
+    counts = df[target].value_counts()
+    valid = counts[counts >= MIN_SAMPLES_PER_CLASS].index
+    dropped = counts[counts < MIN_SAMPLES_PER_CLASS]
+    if len(dropped):
+        print(f"  Dropping {len(dropped)} rare class(es): {dropped.index.tolist()}")
+    df = df[df[target].isin(valid)]
+
+    if len(df) == 0:
+        raise ValueError(f"No usable samples for target='{target}'.")
+
+    return df["text"].reset_index(drop=True), df[target].reset_index(drop=True)
+
+
+# ==============================================================================
+# RESULT STORE  (сбор и отображение результатов)
+# ==============================================================================
+
+class ResultStore:
+    """Накапливает результаты всех моделей для итогового сравнения (раздел 3.4)."""
+
+    def __init__(self):
+        self.records: list[dict] = []
+
+    def record(
+        self,
+        name: str,
+        group: str,
+        y_test,
+        y_pred,
+        train_sec: float,
+        infer_ms_total: float,
+        notes: str = "",
+    ) -> float:
+        n = len(y_test)
+        f1   = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+        prec = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+        rec  = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+        self.records.append({
+            "model":              name,
+            "group":              group,
+            "f1_weighted":        round(f1, 4),
+            "precision":          round(prec, 4),
+            "recall":             round(rec, 4),
+            "train_sec":          round(train_sec, 1),
+            "infer_ms_per_sample": round(infer_ms_total / max(n, 1), 3),
+            "resource":           RESOURCE_MAP.get(group, "—"),
+            "notes":              notes,
+            "_report":            classification_report(y_test, y_pred, zero_division=0, output_dict=True),
+            "_y_test":            list(y_test),
+            "_y_pred":            list(y_pred),
+        })
+        return f1
+
+    def summary_df(self) -> pd.DataFrame:
+        rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in self.records]
+        return (
+            pd.DataFrame(rows)
+            .sort_values("f1_weighted", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def print_summary(self):
+        df = self.summary_df()
+        print(f"\n  {'Модель':<40} {'F1':>6} {'Prec':>6} {'Rec':>6} {'Train':>8} {'ms/сэмпл':>10}  Ресурсы")
+        print(f"  {'─' * 95}")
+        for _, row in df.iterrows():
+            print(
+                f"  {row['model']:<40} {row['f1_weighted']:>6.3f} "
+                f"{row['precision']:>6.3f} {row['recall']:>6.3f} "
+                f"{row['train_sec']:>7.1f}s {row['infer_ms_per_sample']:>9.2f}ms"
+                f"  {row['resource']}"
+            )
+
+
+# ==============================================================================
+# VISUALIZATION HELPERS
+# ==============================================================================
+
+def save_confusion_matrix(y_test, y_pred, model_name: str, output_dir: Path):
+    labels = sorted(set(y_test))
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
+    fig, ax = plt.subplots(figsize=(max(6, len(labels)), max(5, len(labels) - 1)))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=labels, yticklabels=labels, ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(model_name)
+    plt.tight_layout()
+    safe = (model_name.replace(" ", "_").replace("/", "-")
+            .replace("+", "plus").replace("(", "").replace(")", ""))
+    path = output_dir / f"cm_{safe}.png"
+    plt.savefig(path, dpi=110)
+    plt.close()
+
+
+def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
+    df = store.summary_df()
+    if df.empty:
+        return
+
+    COLORS = {
+        "baseline":     "#4C72B0",
+        "embeddings":   "#55A868",
+        "transformers": "#C44E52",
+        "llm":          "#8172B2",
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(df) * 0.5 + 2)))
+    fig.suptitle(f"Сравнение моделей — {target}", fontsize=13, fontweight="bold")
+
+    # ── Left: F1 bar chart ──────────────────────────────────────────────────
+    ax = axes[0]
+    bar_colors = [COLORS.get(r, "#777777") for r in df["group"]]
+    bars = ax.barh(df["model"], df["f1_weighted"], color=bar_colors, height=0.6)
+    ax.set_xlabel("F1 (weighted)")
+    ax.set_title("F1-score по моделям")
+    ax.set_xlim(0, 1.05)
+    ax.axvline(x=0.8, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    for bar, val in zip(bars, df["f1_weighted"]):
+        ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+                f"{val:.3f}", va="center", fontsize=8)
+    ax.invert_yaxis()
+
+    # ── Right: F1 vs speed scatter ──────────────────────────────────────────
+    ax2 = axes[1]
+    for _, row in df.iterrows():
+        color = COLORS.get(row["group"], "#777777")
+        ax2.scatter(row["infer_ms_per_sample"], row["f1_weighted"],
+                    c=color, s=90, zorder=3)
+        ax2.annotate(
+            row["model"],
+            (row["infer_ms_per_sample"], row["f1_weighted"]),
+            fontsize=7, xytext=(4, 3), textcoords="offset points",
+        )
+    ax2.set_xlabel("Время инференса (мс / образец)")
+    ax2.set_ylabel("F1 (weighted)")
+    ax2.set_title("Качество vs Скорость")
+    ax2.grid(True, alpha=0.3)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=v, label=k)
+        for k, v in COLORS.items()
+        if k in df["group"].values
+    ]
+    ax2.legend(handles=legend_elements, loc="lower right", fontsize=8)
+
+    plt.tight_layout()
+    path = output_dir / f"comparison_{target}.png"
+    plt.savefig(path, dpi=110)
+    plt.close()
+    print(f"  График сравнения: {path.name}")
+
+
+# ==============================================================================
+# SECTION 3.2 — БАЗОВЫЕ АЛГОРИТМЫ КЛАССИФИКАЦИИ
+# ==============================================================================
+
+def build_baseline_pipelines() -> dict[str, Pipeline]:
+    """
+    3.2.1 Векторизация: BoW, TF-IDF, N-gram TF-IDF.
+    3.2.2 Классификаторы: LogReg, SVM, NaiveBayes, RandomForest.
+
+    Итого 10 пайплайнов для всестороннего baseline-сравнения.
+    """
+    bow_kw    = dict(max_features=15_000, min_df=1)
+    tfidf_kw  = dict(ngram_range=(1, 2), max_features=15_000,
+                     sublinear_tf=True, min_df=1)
+    ngram_kw  = dict(ngram_range=(1, 3), max_features=20_000,
+                     sublinear_tf=True, min_df=1)
+
+    lr_kw  = dict(max_iter=1000, class_weight="balanced", C=1.0,
+                  solver="lbfgs", multi_class="auto")
+    svm_kw = dict(max_iter=3000, class_weight="balanced", C=1.0)
+    rf_kw  = dict(n_estimators=200, class_weight="balanced",
+                  random_state=42, n_jobs=-1)
+
+    return {
+        # ── BoW ────────────────────────────────────────────────────────────
+        "BoW + LogReg": Pipeline([
+            ("vec", CountVectorizer(**bow_kw)),
+            ("clf", LogisticRegression(**lr_kw)),
+        ]),
+        "BoW + SVM": Pipeline([
+            ("vec", CountVectorizer(**bow_kw)),
+            ("clf", LinearSVC(**svm_kw)),
+        ]),
+        "BoW + NaiveBayes": Pipeline([
+            ("vec", CountVectorizer(**bow_kw)),
+            ("clf", MultinomialNB(alpha=0.1)),
+        ]),
+        "BoW + RandomForest": Pipeline([
+            ("vec", CountVectorizer(**bow_kw)),
+            ("clf", RandomForestClassifier(**rf_kw)),
+        ]),
+        # ── TF-IDF ─────────────────────────────────────────────────────────
+        "TF-IDF + LogReg": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            ("clf", LogisticRegression(**lr_kw)),
+        ]),
+        "TF-IDF + SVM": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            ("clf", LinearSVC(**svm_kw)),
+        ]),
+        "TF-IDF + NaiveBayes": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            # ComplementNB лучше MNB для несбалансированных данных с TF-IDF
+            ("clf", ComplementNB(alpha=0.1)),
+        ]),
+        "TF-IDF + RandomForest": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            ("clf", RandomForestClassifier(**rf_kw)),
+        ]),
+        # ── N-gram TF-IDF ──────────────────────────────────────────────────
+        "N-gram(1-3) + SVM": Pipeline([
+            ("vec", TfidfVectorizer(**ngram_kw)),
+            ("clf", LinearSVC(**svm_kw)),
+        ]),
+        "N-gram(1-3) + LogReg": Pipeline([
+            ("vec", TfidfVectorizer(**ngram_kw)),
+            ("clf", LogisticRegression(**lr_kw)),
+        ]),
+    }
+
+
+def run_baseline_models(
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+):
+    """
+    3.2 Базовые алгоритмы классификации.
+    Precision / Recall / F1 / матрица ошибок для каждого пайплайна.
+    """
+    print(f"\n{'═' * 60}")
+    print("  3.2  Базовые алгоритмы (BoW / TF-IDF / N-gram)")
+    print(f"{'═' * 60}")
+
+    for name, pipeline in build_baseline_pipelines().items():
+        print(f"\n  [{name}]")
+        try:
+            t0 = time.perf_counter()
+            pipeline.fit(X_train, y_train)
+            train_sec = time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+            y_pred = pipeline.predict(X_test)
+            infer_ms = (time.perf_counter() - t1) * 1000
+
+            f1 = store.record(name, "baseline", y_test, y_pred, train_sec, infer_ms)
+            print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+            print(classification_report(y_test, y_pred, zero_division=0))
+
+            save_confusion_matrix(y_test, y_pred, name, output_dir)
+
+            safe = (name.replace(" ", "_").replace("+", "plus")
+                    .replace("/", "-").replace("(", "").replace(")", ""))
+            joblib.dump(pipeline, output_dir / f"{safe}.joblib")
+
+        except Exception as exc:
+            print(f"    ОШИБКА: {exc}")
+
+
+# ==============================================================================
+# SECTION 3.3.1 — ЭМБЕДДИНГИ СЛОВ И ПРЕДЛОЖЕНИЙ
+# ==============================================================================
+
+class MeanEmbeddingTransformer(BaseEstimator, TransformerMixin):
+    """
+    Усредняет векторы слов из Word2Vec или fastText (gensim).
+    Обучается на тренировочном корпусе «с нуля».
+    Для OOV: Word2Vec возвращает нулевой вектор; fastText использует субслова.
+    """
+
+    def __init__(
+        self,
+        model_type: str = "word2vec",
+        vector_size: int = 150,
+        window: int = 5,
+        min_count: int = 1,
+        epochs: int = 15,
+    ):
+        self.model_type = model_type
+        self.vector_size = vector_size
+        self.window = window
+        self.min_count = min_count
+        self.epochs = epochs
+        self.model_ = None
+
+    @staticmethod
+    def _tokenize(texts):
+        return [str(t).lower().split() for t in texts]
+
+    def fit(self, X, y=None):
+        sentences = self._tokenize(X)
+        if self.model_type == "fasttext":
+            from gensim.models import FastText
+            self.model_ = FastText(
+                sentences=sentences, vector_size=self.vector_size,
+                window=self.window, min_count=self.min_count,
+                epochs=self.epochs, workers=4, seed=42,
+            )
+        else:
+            from gensim.models import Word2Vec
+            self.model_ = Word2Vec(
+                sentences=sentences, vector_size=self.vector_size,
+                window=self.window, min_count=self.min_count,
+                epochs=self.epochs, workers=4, seed=42,
+            )
+        return self
+
+    def transform(self, X):
+        result = []
+        for text in X:
+            words = str(text).lower().split()
+            vecs = [self.model_.wv[w] for w in words if w in self.model_.wv]
+            result.append(
+                np.mean(vecs, axis=0) if vecs else np.zeros(self.vector_size)
+            )
+        return np.array(result, dtype=np.float32)
+
+
+class Doc2VecTransformer(BaseEstimator, TransformerMixin):
+    """
+    Doc2Vec (Paragraph Vectors, Le & Mikolov 2014).
+    Каждому документу обучается отдельный вектор; для инференса используется
+    infer_vector (итеративная оптимизация).
+    """
+
+    def __init__(
+        self,
+        vector_size: int = 150,
+        window: int = 5,
+        min_count: int = 1,
+        epochs: int = 20,
+    ):
+        self.vector_size = vector_size
+        self.window = window
+        self.min_count = min_count
+        self.epochs = epochs
+        self.model_ = None
+
+    def fit(self, X, y=None):
+        from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+        corpus = [
+            TaggedDocument(str(t).lower().split(), [i])
+            for i, t in enumerate(X)
+        ]
+        self.model_ = Doc2Vec(
+            corpus, vector_size=self.vector_size,
+            window=self.window, min_count=self.min_count,
+            epochs=self.epochs, workers=4, seed=42,
+        )
+        return self
+
+    def transform(self, X):
+        return np.array([
+            self.model_.infer_vector(str(t).lower().split(), epochs=self.epochs)
+            for t in X
+        ], dtype=np.float32)
+
+
+class SBERTTransformer(BaseEstimator, TransformerMixin):
+    """
+    SentenceTransformers (SBERT) — контекстуальные эмбеддинги предложений.
+    Использует предобученные веса; дополнительное обучение не требуется.
+    Рекомендуемая модель: paraphrase-multilingual-MiniLM-L12-v2
+    """
+
+    def __init__(
+        self,
+        model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+        batch_size: int = 64,
+    ):
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.model_ = None
+
+    def fit(self, X, y=None):
+        from sentence_transformers import SentenceTransformer
+        self.model_ = SentenceTransformer(self.model_name)
+        return self
+
+    def transform(self, X):
+        return self.model_.encode(
+            list(X),
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+
+
+def _pkg_available(name: str) -> bool:
+    import importlib
+    try:
+        importlib.import_module(name)
+        return True
+    except ImportError:
+        return False
+
+
+def build_embedding_pipelines(sbert_model: str) -> dict[str, dict]:
+    """3.3.1: Пайплайны с векторными представлениями."""
+    lr_kw  = dict(max_iter=1000, class_weight="balanced", C=1.0, solver="lbfgs")
+    svm_kw = dict(max_iter=3000, class_weight="balanced", C=1.0)
+
+    return {
+        "Word2Vec + LogReg": {
+            "pkg": "gensim",
+            "pipeline": Pipeline([
+                ("emb", MeanEmbeddingTransformer(model_type="word2vec")),
+                ("clf", LogisticRegression(**lr_kw)),
+            ]),
+        },
+        "Doc2Vec + LogReg": {
+            "pkg": "gensim",
+            "pipeline": Pipeline([
+                ("emb", Doc2VecTransformer()),
+                ("clf", LogisticRegression(**lr_kw)),
+            ]),
+        },
+        "fastText + LogReg": {
+            "pkg": "gensim",
+            "pipeline": Pipeline([
+                ("emb", MeanEmbeddingTransformer(model_type="fasttext")),
+                ("clf", LogisticRegression(**lr_kw)),
+            ]),
+        },
+        "fastText + SVM": {
+            "pkg": "gensim",
+            "pipeline": Pipeline([
+                ("emb", MeanEmbeddingTransformer(model_type="fasttext")),
+                ("clf", LinearSVC(**svm_kw)),
+            ]),
+        },
+        "SBERT + LogReg": {
+            "pkg": "sentence_transformers",
+            "pipeline": Pipeline([
+                ("emb", SBERTTransformer(model_name=sbert_model)),
+                ("clf", LogisticRegression(**lr_kw)),
+            ]),
+        },
+        "SBERT + SVM": {
+            "pkg": "sentence_transformers",
+            "pipeline": Pipeline([
+                ("emb", SBERTTransformer(model_name=sbert_model)),
+                ("clf", LinearSVC(**svm_kw)),
+            ]),
+        },
+    }
+
+
+def run_embedding_models(
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+    sbert_model: str = "paraphrase-multilingual-MiniLM-L12-v2",
+):
+    """
+    3.3.1 Эмбеддинги слов и предложений.
+    Word2Vec, Doc2Vec, fastText (gensim) + SBERT (sentence-transformers).
+    """
+    print(f"\n{'═' * 60}")
+    print("  3.3.1  Эмбеддинги (Word2Vec / Doc2Vec / fastText / SBERT)")
+    print(f"{'═' * 60}")
+
+    for name, spec in build_embedding_pipelines(sbert_model).items():
+        pkg = spec["pkg"]
+        if not _pkg_available(pkg):
+            print(f"\n  [{name}]  ПРОПУСК — пакет '{pkg}' не установлен")
+            print(f"    Установка: pip install {pkg.replace('_', '-')}")
+            continue
+
+        print(f"\n  [{name}]")
+        try:
+            t0 = time.perf_counter()
+            spec["pipeline"].fit(X_train, y_train)
+            train_sec = time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+            y_pred = spec["pipeline"].predict(X_test)
+            infer_ms = (time.perf_counter() - t1) * 1000
+
+            f1 = store.record(name, "embeddings", y_test, y_pred, train_sec, infer_ms)
+            print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+            print(classification_report(y_test, y_pred, zero_division=0))
+
+            save_confusion_matrix(y_test, y_pred, name, output_dir)
+
+            safe = (name.replace(" ", "_").replace("+", "plus")
+                    .replace("/", "-").replace("(", "").replace(")", ""))
+            joblib.dump(spec["pipeline"], output_dir / f"{safe}.joblib")
+
+        except Exception as exc:
+            print(f"    ОШИБКА: {exc}")
+
+
+# ==============================================================================
+# SECTION 3.3.2 — ТРАНСФОРМЕРЫ (FINE-TUNING)
+# ==============================================================================
+
+def _finetune_transformer(
+    model_name: str,
+    friendly_name: str,
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+    epochs: int = 3,
+    batch_size: int = 16,
+    max_length: int = 256,
+    lr: float = 2e-5,
+    fp16: bool = False,
+    bf16: bool = False,
+    grad_accum: int = 1,
+    compile_model: bool = False,
+):
+    """
+    Fine-tuning AutoModelForSequenceClassification (RuBERT или XLM-RoBERTa).
+
+    Особенности:
+    - Взвешенная кросс-энтропия для несбалансированных классов.
+    - Линейный warmup (10 % шагов) + линейный decay.
+    - Динамический padding (per-batch) для ускорения.
+    - Mixed precision: fp16 (GradScaler) или bf16 (Ampere+/Blackwell).
+    - Gradient accumulation для эффективного увеличения batch size.
+    - torch.compile() для дополнительного ускорения (PyTorch ≥ 2.0).
+    - Сохранение лучших весов и LabelEncoder.
+    """
+    try:
+        import torch
+        from torch.utils.data import DataLoader, Dataset as TorchDataset
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            get_linear_schedule_with_warmup,
+        )
+    except ImportError as e:
+        print(f"\n  [{friendly_name}]  ПРОПУСК — {e}")
+        print("    Установка: pip install transformers torch accelerate")
+        return
+
+    print(f"\n  [{friendly_name}]  модель: {model_name}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"    Устройство: {device}")
+    if device.type == "cuda":
+        vram = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
+        print(f"    GPU: {torch.cuda.get_device_name(device)}  |  VRAM: {vram:.1f} GB")
+        eff_batch = batch_size * grad_accum
+        prec_str  = "bf16" if bf16 else ("fp16" if fp16 else "fp32")
+        print(f"    Precision: {prec_str}  |  "
+              f"batch={batch_size}  ×  grad_accum={grad_accum}  →  eff_batch={eff_batch}")
+
+    # ── Label encoding ────────────────────────────────────────────────────────
+    le = LabelEncoder()
+    le.fit(list(y_train) + list(y_test))
+    y_tr = le.transform(y_train)
+    y_te = le.transform(y_test)
+    num_labels = len(le.classes_)
+
+    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # ── Dataset с динамическим padding (collate_fn) ────────────────────────
+    class TextDataset(TorchDataset):
+        def __init__(self, texts, labels):
+            self.texts  = list(texts)
+            self.labels = list(labels)
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, idx):
+            return self.texts[idx], self.labels[idx]
+
+    def collate_fn(batch):
+        texts, labels = zip(*batch)
+        enc = tokenizer(
+            list(texts),
+            truncation=True,
+            max_length=max_length,
+            padding=True,
+            return_tensors="pt",
+        )
+        return enc, torch.tensor(labels, dtype=torch.long)
+
+    use_pin = device.type == "cuda"
+    train_loader = DataLoader(
+        TextDataset(X_train, y_tr), batch_size=batch_size,
+        shuffle=True, collate_fn=collate_fn,
+        num_workers=2, pin_memory=use_pin, persistent_workers=True,
+    )
+    test_loader = DataLoader(
+        TextDataset(X_test, y_te), batch_size=batch_size * 2,
+        collate_fn=collate_fn,
+        num_workers=2, pin_memory=use_pin, persistent_workers=True,
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=num_labels, ignore_mismatched_sizes=True
+    ).to(device)
+
+    # ── torch.compile() (PyTorch ≥ 2.0, +15–30 % на Ampere/Blackwell) ────────
+    if compile_model:
+        if hasattr(torch, "compile"):
+            print("    torch.compile() — компиляция графа (первый батч медленнее)...")
+            model = torch.compile(model)
+        else:
+            print("    ПРЕДУПРЕЖДЕНИЕ: torch.compile() требует PyTorch ≥ 2.0, пропуск")
+
+    # ── Weighted loss (class imbalance) ───────────────────────────────────────
+    cw = compute_class_weight("balanced", classes=np.arange(num_labels), y=y_tr)
+    loss_fn = torch.nn.CrossEntropyLoss(
+        weight=torch.tensor(cw, dtype=torch.float).to(device)
+    )
+
+    # ── Optimizer + scheduler ─────────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # Число оптимизаторных шагов с учётом gradient accumulation
+    opt_steps_per_epoch = max(1, len(train_loader) // grad_accum)
+    total_steps  = opt_steps_per_epoch * epochs
+    warmup_steps = max(1, int(0.1 * total_steps))
+    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+    # ── Mixed precision ────────────────────────────────────────────────────────
+    use_amp   = (fp16 or bf16) and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if bf16 else torch.float16
+    # GradScaler нужен только для fp16 (bf16 не требует масштабирования)
+    scaler = torch.cuda.amp.GradScaler(enabled=(fp16 and device.type == "cuda"))
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    best_model_state = None
+    best_f1 = -1.0
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        optimizer.zero_grad()
+
+        for step, (enc, labels) in enumerate(tqdm(
+            train_loader, desc=f"    Epoch {epoch + 1}/{epochs}", leave=False
+        )):
+            enc    = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+            labels = labels.to(device, non_blocking=True)
+
+            # autocast: включается только при use_amp и только для CUDA
+            with torch.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=use_amp
+            ):
+                outputs = model(**enc)
+                # Делим loss на grad_accum для корректного среднего за accum-шаг
+                loss = loss_fn(outputs.logits, labels) / grad_accum
+
+            if fp16 and device.type == "cuda":
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            total_loss += loss.item() * grad_accum
+
+            is_last = (step + 1) == len(train_loader)
+            if (step + 1) % grad_accum == 0 or is_last:
+                if fp16 and device.type == "cuda":
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+        avg_loss = total_loss / len(train_loader)
+
+        # Quick val on test to track best epoch
+        model.eval()
+        preds_epoch = []
+        with torch.no_grad():
+            for enc, _ in test_loader:
+                enc = {k: v.to(device) for k, v in enc.items()}
+                out = model(**enc)
+                preds_epoch.extend(torch.argmax(out.logits, 1).cpu().tolist())
+        epoch_f1 = f1_score(y_te, preds_epoch, average="weighted", zero_division=0)
+        print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
+
+        if epoch_f1 > best_f1:
+            best_f1 = epoch_f1
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    train_sec = time.perf_counter() - t0
+
+    # ── Load best checkpoint ──────────────────────────────────────────────────
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # ── Inference ─────────────────────────────────────────────────────────────
+    model.eval()
+    all_preds = []
+    t1 = time.perf_counter()
+    with torch.no_grad():
+        for enc, _ in test_loader:
+            enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+            with torch.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=use_amp
+            ):
+                out = model(**enc)
+            all_preds.extend(torch.argmax(out.logits, 1).cpu().tolist())
+    infer_ms = (time.perf_counter() - t1) * 1000
+
+    y_pred      = le.inverse_transform(np.array(all_preds))
+    y_test_orig = list(y_test)
+
+    f1 = store.record(
+        friendly_name, "transformers", y_test_orig, y_pred,
+        train_sec, infer_ms, notes=model_name,
+    )
+    print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+    print(classification_report(y_test_orig, y_pred, zero_division=0))
+    save_confusion_matrix(y_test_orig, y_pred, friendly_name, output_dir)
+
+    # ── Save model ────────────────────────────────────────────────────────────
+    safe = (friendly_name.replace(" ", "_").replace("/", "-")
+            .replace("(", "").replace(")", ""))
+    model_out = output_dir / safe
+    model_out.mkdir(exist_ok=True)
+    model.save_pretrained(str(model_out))
+    tokenizer.save_pretrained(str(model_out))
+    joblib.dump(le, model_out / "label_encoder.joblib")
+    print(f"    Сохранено: {model_out.name}/")
+
+
+def run_transformer_models(
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+    rubert_model: str = "cointegrated/rubert-tiny2",
+    xlmr_model:   str = "xlm-roberta-base",
+    epochs: int = 3,
+    batch_size: int = 16,
+    groups: set = None,
+    fp16: bool = False,
+    bf16: bool = False,
+    grad_accum: int = 1,
+    compile_model: bool = False,
+):
+    """
+    3.3.2 Модели на основе трансформеров.
+    Fine-tuning с учётом дисбаланса классов и линейным lr-расписанием.
+    """
+    print(f"\n{'═' * 60}")
+    print("  3.3.2  Трансформеры (RuBERT / XLM-RoBERTa fine-tuning)")
+    print(f"{'═' * 60}")
+
+    run_all = groups is None or "all" in groups or "transformers" in groups
+
+    models = []
+    if run_all or "rubert" in (groups or set()):
+        models.append((rubert_model, "RuBERT (fine-tuned)"))
+    if run_all or "xlmr" in (groups or set()):
+        models.append((xlmr_model, "XLM-RoBERTa (fine-tuned)"))
+
+    for model_id, name in models:
+        _finetune_transformer(
+            model_name=model_id, friendly_name=name,
+            X_train=X_train, y_train=y_train,
+            X_test=X_test, y_test=y_test,
+            store=store, output_dir=output_dir,
+            epochs=epochs, batch_size=batch_size,
+            fp16=fp16, bf16=bf16, grad_accum=grad_accum,
+            compile_model=compile_model,
+        )
+
+
+# ==============================================================================
+# SECTION 3.3.3 — LLM: ZERO-SHOT И FEW-SHOT КЛАССИФИКАЦИЯ
+# ==============================================================================
+
+def _zero_shot_prompt(text: str, label_names: list[str], target_desc: str) -> str:
+    cats = "\n".join(f"  - {l}" for l in label_names)
+    return (
+        f"Ты — система классификации обращений в техническую поддержку.\n"
+        f"Определи {target_desc} для следующего транскрипта звонка.\n\n"
+        f"Допустимые категории:\n{cats}\n\n"
+        f"Ответь ТОЛЬКО точным названием одной категории из списка выше. "
+        f"Без пояснений и дополнительного текста.\n\n"
+        f"Транскрипт:\n{str(text)[:1500]}\n\n"
+        f"Категория:"
+    )
+
+
+def _few_shot_prompt(
+    text: str,
+    label_names: list[str],
+    examples: list[tuple[str, str]],
+    target_desc: str,
+) -> str:
+    cats = "\n".join(f"  - {l}" for l in label_names)
+    exs  = "\n\n".join(
+        f"Транскрипт:\n{ex[:500]}\nКатегория: {lbl}"
+        for ex, lbl in examples
+    )
+    return (
+        f"Ты — система классификации обращений в техническую поддержку.\n"
+        f"Определи {target_desc} для транскрипта звонка.\n\n"
+        f"Допустимые категории:\n{cats}\n\n"
+        f"Примеры:\n\n{exs}\n\n"
+        f"Теперь классифицируй:\nТранскрипт:\n{str(text)[:1500]}\n\n"
+        f"Ответь ТОЛЬКО точным названием одной категории из списка. Категория:"
+    )
+
+
+def _call_llm(
+    prompt: str, api_base: str, api_key: str, model: str, max_tokens: int = 50
+) -> Optional[str]:
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=api_base, api_key=api_key or "ollama")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        print(f"      [API error] {exc}", file=sys.stderr)
+        return None
+
+
+def _match_label(response: Optional[str], label_names: list[str]) -> Optional[str]:
+    """Сопоставить ответ LLM с ближайшей категорией."""
+    if not response:
+        return None
+    r = response.lower().strip()
+    for lbl in label_names:
+        if lbl.lower() == r:
+            return lbl
+    for lbl in label_names:
+        if lbl.lower() in r or r in lbl.lower():
+            return lbl
+    first = r.split()[0] if r.split() else ""
+    for lbl in label_names:
+        if first in lbl.lower():
+            return lbl
+    return None
+
+
+def run_llm_models(
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+    api_base: str,
+    api_key: str,
+    llm_model: str,
+    few_shot_n: int = 3,
+    target_desc: str = "категорию обращения",
+    max_samples: int = 200,
+):
+    """
+    3.3.3 LLM: zero-shot и few-shot классификация.
+
+    Zero-shot — модель классифицирует без примеров.
+    Few-shot  — модели показываются N примеров каждого класса из train-выборки.
+    """
+    print(f"\n{'═' * 60}")
+    print(f"  3.3.3  LLM ({llm_model}) — zero-shot / few-shot")
+    print(f"{'═' * 60}")
+
+    if not _pkg_available("openai"):
+        print("  ПРОПУСК — пакет 'openai' не установлен. Установка: pip install openai")
+        return
+
+    label_names = sorted(y_test.unique())
+
+    # Ограничиваем выборку (экономия API-вызовов)
+    if len(X_test) > max_samples:
+        print(f"  Ограничение: используем {max_samples} из {len(X_test)} тестовых примеров")
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(X_test), max_samples, replace=False)
+        X_eval = X_test.iloc[idx]
+        y_eval = y_test.iloc[idx]
+    else:
+        X_eval, y_eval = X_test, y_test
+
+    # Few-shot примеры (N штук каждого класса из train)
+    few_shot_examples: list[tuple[str, str]] = []
+    for lbl in label_names:
+        mask  = y_train == lbl
+        texts = X_train[mask].tolist()[:few_shot_n]
+        few_shot_examples.extend((t, lbl) for t in texts)
+
+    # ── Zero-shot ──────────────────────────────────────────────────────────────
+    print(f"\n  [LLM Zero-shot ({llm_model})]")
+    y_pred_zero: list[str] = []
+    fallbacks = 0
+    t1 = time.perf_counter()
+    for text in tqdm(X_eval, desc="    zero-shot"):
+        prompt = _zero_shot_prompt(text, label_names, target_desc)
+        resp   = _call_llm(prompt, api_base, api_key, llm_model)
+        pred   = _match_label(resp, label_names)
+        if pred is None:
+            pred = label_names[0]
+            fallbacks += 1
+        y_pred_zero.append(pred)
+    infer_ms_zero = (time.perf_counter() - t1) * 1000
+
+    if fallbacks:
+        print(f"    Нераспознанных ответов: {fallbacks} (замена → '{label_names[0]}')")
+
+    f1_z = store.record(
+        f"LLM Zero-shot ({llm_model})", "llm",
+        list(y_eval), y_pred_zero,
+        train_sec=0.0, infer_ms_total=infer_ms_zero,
+        notes="zero-shot, обучение не требуется",
+    )
+    print(f"    F1: {f1_z:.3f}")
+    print(classification_report(list(y_eval), y_pred_zero, zero_division=0))
+    save_confusion_matrix(
+        list(y_eval), y_pred_zero, f"LLM_Zero-shot_{llm_model}", output_dir
+    )
+
+    # ── Few-shot ───────────────────────────────────────────────────────────────
+    print(f"\n  [LLM Few-shot ({llm_model}, {few_shot_n} примеров/класс)]")
+    y_pred_few: list[str] = []
+    fallbacks = 0
+    t2 = time.perf_counter()
+    for text in tqdm(X_eval, desc="    few-shot"):
+        prompt = _few_shot_prompt(text, label_names, few_shot_examples, target_desc)
+        resp   = _call_llm(prompt, api_base, api_key, llm_model)
+        pred   = _match_label(resp, label_names)
+        if pred is None:
+            pred = label_names[0]
+            fallbacks += 1
+        y_pred_few.append(pred)
+    infer_ms_few = (time.perf_counter() - t2) * 1000
+
+    if fallbacks:
+        print(f"    Нераспознанных ответов: {fallbacks} (замена → '{label_names[0]}')")
+
+    f1_f = store.record(
+        f"LLM Few-shot ({llm_model})", "llm",
+        list(y_eval), y_pred_few,
+        train_sec=0.0, infer_ms_total=infer_ms_few,
+        notes=f"few-shot, {few_shot_n} примеров/класс",
+    )
+    print(f"    F1: {f1_f:.3f}")
+    print(classification_report(list(y_eval), y_pred_few, zero_division=0))
+    save_confusion_matrix(
+        list(y_eval), y_pred_few, f"LLM_Few-shot_{llm_model}", output_dir
+    )
+
+
+# ==============================================================================
+# SECTION 3.4 — СРАВНИТЕЛЬНЫЙ АНАЛИЗ МОДЕЛЕЙ
+# ==============================================================================
+
+def generate_comparison_report(store: ResultStore, output_dir: Path, target: str):
+    """
+    3.4 Сравнительный анализ.
+
+    Формирует:
+    - итоговую таблицу в stdout (F1, Precision, Recall, скорость, ресурсы)
+    - comparison.csv
+    - run_log.json (полные метрики)
+    - comparison_<target>.png (bar chart + speed scatter)
+    """
+    print(f"\n{'═' * 60}")
+    print("  3.4  Сравнительный анализ моделей")
+    print(f"{'═' * 60}")
+
+    store.print_summary()
+
+    df = store.summary_df()
+
+    # CSV
+    csv_path = output_dir / "comparison.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    print(f"\n  CSV-таблица    : {csv_path.name}")
+
+    # JSON
+    json_path = output_dir / "run_log.json"
+    log = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "target":    target,
+        "models": [
+            {k: v for k, v in r.items() if k not in ("_y_test", "_y_pred")}
+            for r in store.records
+        ],
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+    print(f"  Подробный лог  : {json_path.name}")
+
+    # Chart
+    save_comparison_chart(store, output_dir, target)
+
+    # Thesis-style table
+    def speed_label(ms):
+        if ms < 1.0:  return "высокая"
+        if ms < 50:   return "средняя"
+        return "низкая"
+
+    print(f"\n  {'─' * 80}")
+    print(f"  {'Модель':<38} {'F1':>8} {'Скорость':>10} {'Ресурсы':<18} Примечание")
+    print(f"  {'─' * 80}")
+    for _, row in df.iterrows():
+        print(
+            f"  {row['model']:<38} {row['f1_weighted']:>8.3f} "
+            f"{speed_label(row['infer_ms_per_sample']):>10} "
+            f"{row['resource']:<18} {row['notes']}"
+        )
+    print(f"  {'─' * 80}")
+
+
+# ==============================================================================
+# ORCHESTRATION
+# ==============================================================================
+
+_TARGET_DESCRIPTIONS = {
+    "call_purpose": "цель звонка",
+    "priority":     "приоритет обращения",
+    "assig_group":  "группу специалистов",
+}
+
+
+def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
+    """Запускает все запрошенные группы моделей для одного таргета."""
+    print(f"\n{'━' * 60}")
+    print(f"  ТАРГЕТ: {target}")
+    print(f"{'━' * 60}")
+
+    target_dir = output_dir / target
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        X, y = load_data(csv_path, target, sep=args.sep)
+    except ValueError as e:
+        print(f"  Пропуск: {e}")
+        return
+
+    print(f"  Всего: {len(X)} примеров, {y.nunique()} классов")
+    for cls, cnt in y.value_counts().items():
+        print(f"    {cls:<35} {cnt:>4}  {'█' * min(cnt, 40)}")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=42, stratify=y
+    )
+    print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
+
+    groups = set(g.strip() for g in args.groups.split(","))
+    run_all = "all" in groups
+
+    store = ResultStore()
+
+    # ── 3.2 ──────────────────────────────────────────────────────────────────
+    if run_all or "baseline" in groups:
+        run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir)
+
+    # ── 3.3.1 ─────────────────────────────────────────────────────────────────
+    embedding_groups = {"embeddings", "word2vec", "doc2vec", "fasttext", "sbert"}
+    if run_all or groups & embedding_groups:
+        run_embedding_models(
+            X_train, y_train, X_test, y_test, store, target_dir,
+            sbert_model=args.sbert_model,
+        )
+
+    # ── 3.3.2 ─────────────────────────────────────────────────────────────────
+    transformer_groups = {"transformers", "rubert", "xlmr"}
+    if run_all or groups & transformer_groups:
+        run_transformer_models(
+            X_train, y_train, X_test, y_test, store, target_dir,
+            rubert_model=args.rubert_model,
+            xlmr_model=args.xlmr_model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            groups=groups,
+            fp16=args.fp16,
+            bf16=args.bf16,
+            grad_accum=args.grad_accum,
+            compile_model=args.compile,
+        )
+
+    # ── 3.3.3 ─────────────────────────────────────────────────────────────────
+    if run_all or "llm" in groups:
+        if not args.llm_api_base:
+            print("\n  [LLM]  ПРОПУСК — укажите --llm-api-base")
+        else:
+            run_llm_models(
+                X_train, y_train, X_test, y_test, store, target_dir,
+                api_base=args.llm_api_base,
+                api_key=args.llm_api_key or "ollama",
+                llm_model=args.llm_model,
+                few_shot_n=args.few_shot_n,
+                target_desc=_TARGET_DESCRIPTIONS.get(target, target),
+                max_samples=args.llm_max_samples,
+            )
+
+    # ── 3.4 ──────────────────────────────────────────────────────────────────
+    if store.records:
+        generate_comparison_report(store, target_dir, target)
+    else:
+        print("\n  Нет результатов для сравнения.")
+
+
+# ==============================================================================
+# CLI
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Полный пайплайн ML/DL классификации транскриптов звонков (3.2–3.4)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Группы моделей (--groups):
+  baseline     — BoW/TF-IDF + LogReg/SVM/NB/RF
+  embeddings   — Word2Vec, Doc2Vec, fastText, SBERT
+  rubert       — RuBERT fine-tuning (требует transformers + torch)
+  xlmr         — XLM-RoBERTa fine-tuning
+  transformers — rubert + xlmr вместе
+  llm          — zero-shot + few-shot через OpenAI-совместимый API
+  all          — все группы
+
+Примеры:
+  python train_advanced.py -i dataset_clean.csv -g baseline
+  python train_advanced.py -i dataset_clean.csv -g baseline,embeddings -t all
+  python train_advanced.py -i dataset_clean.csv -g baseline,rubert --epochs 5
+  python train_advanced.py -i dataset_clean.csv -g llm \\
+      --llm-api-base http://localhost:11434/v1 --llm-model llama3
+  python train_advanced.py -i dataset_clean.csv -g all -t all
+        """,
+    )
+
+    # ── Основные аргументы ────────────────────────────────────────────────────
+    parser.add_argument("-i", "--input", required=True,
+                        help="Входной CSV (выход prepare_dataset.py)")
+    parser.add_argument("-t", "--target", default="call_purpose",
+                        choices=TARGETS + ["all"],
+                        help="Целевая колонка (default: call_purpose)")
+    parser.add_argument("-g", "--groups", default="baseline",
+                        help="Группы моделей через запятую (default: baseline)")
+    parser.add_argument("-o", "--output", default="models_advanced",
+                        help="Папка для моделей и отчётов (default: models_advanced)")
+    parser.add_argument("--sep", default=";",
+                        help="Разделитель CSV (default: ;)")
+
+    # ── Эмбеддинги ────────────────────────────────────────────────────────────
+    parser.add_argument("--sbert-model",
+                        default="paraphrase-multilingual-MiniLM-L12-v2",
+                        help="HuggingFace ID для SBERT")
+
+    # ── Трансформеры ──────────────────────────────────────────────────────────
+    parser.add_argument("--rubert-model", default="cointegrated/rubert-tiny2",
+                        help="HuggingFace ID для RuBERT (default: cointegrated/rubert-tiny2)")
+    parser.add_argument("--xlmr-model", default="xlm-roberta-base",
+                        help="HuggingFace ID для XLM-RoBERTa (default: xlm-roberta-base)")
+    parser.add_argument("--epochs", type=int, default=3,
+                        help="Эпохи fine-tuning (default: 3)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batch size для трансформеров (default: 16)")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Mixed precision fp16 (быстрее на Volta/Turing/Ampere+)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Mixed precision bf16 (стабильнее, только Ampere+)")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Gradient accumulation шагов (default: 1). "
+                             "Eff. batch = batch-size × grad-accum")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile() — ускорение графа (PyTorch ≥ 2.0, "
+                             "первый батч медленнее из-за JIT)")
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+    parser.add_argument("--llm-api-base", default=None,
+                        help="URL OpenAI-совместимого API (напр. http://localhost:11434/v1)")
+    parser.add_argument("--llm-api-key", default=None,
+                        help="API-ключ (для Ollama подойдёт любая строка)")
+    parser.add_argument("--llm-model", default="llama3",
+                        help="Имя LLM-модели (default: llama3)")
+    parser.add_argument("--few-shot-n", type=int, default=3,
+                        help="Примеров на класс для few-shot (default: 3)")
+    parser.add_argument("--llm-max-samples", type=int, default=200,
+                        help="Макс. число тестовых примеров для LLM (default: 200)")
+
+    args = parser.parse_args()
+
+    if args.fp16 and args.bf16:
+        print("Ошибка: --fp16 и --bf16 нельзя использовать одновременно.")
+        sys.exit(1)
+
+    print_gpu_info()
+
+    csv_path   = Path(args.input).resolve()
+    output_dir = Path(args.output).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not csv_path.exists():
+        print(f"Ошибка: файл '{csv_path}' не найден.")
+        sys.exit(1)
+
+    targets = TARGETS if args.target == "all" else [args.target]
+    for target in targets:
+        run_target(csv_path, target, output_dir, args)
+
+    print(f"\n{'━' * 60}")
+    print(f"  Готово. Результаты: {output_dir}")
+    print(f"{'━' * 60}\n")
+
+
+if __name__ == "__main__":
+    main()
