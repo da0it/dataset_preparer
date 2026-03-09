@@ -938,6 +938,7 @@ def run_transformer_models(
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
+    extra_models: list = None,
 ):
     """
     3.3.2 Модели на основе трансформеров.
@@ -954,6 +955,19 @@ def run_transformer_models(
         models.append((rubert_model, "RuBERT (fine-tuned)"))
     if run_all or "xlmr" in (groups or set()):
         models.append((xlmr_model, "XLM-RoBERTa (fine-tuned)"))
+
+    # Дополнительные модели из --extra-models
+    if extra_models:
+        for entry in extra_models:
+            entry = entry.strip()
+            if not entry:
+                continue
+            # Поддержка формата "model_id:Название" или просто "model_id"
+            if ":" in entry:
+                m_id, m_name = entry.split(":", 1)
+            else:
+                m_name = entry.split("/")[-1]  # короткое имя из HF path
+            models.append((entry.split(":")[0].strip(), m_name.strip()))
 
     for model_id, name in models:
         _finetune_transformer(
@@ -1291,6 +1305,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             freeze_layers=args.freeze_layers,
             label_smoothing=args.label_smoothing,
             early_stopping=args.early_stopping,
+            extra_models=args.extra_models,
         )
 
     # ── 3.3.3 ─────────────────────────────────────────────────────────────────
@@ -1391,6 +1406,10 @@ def main():
                              "Рекомендуется 0.1 для малых датасетов")
     parser.add_argument("--early-stopping", type=int, default=0,
                         help="Остановить если нет улучшения N эпох подряд (default: 0 = выкл)")
+    parser.add_argument("--extra-models", type=lambda s: s.split(","), default=None,
+                        help="Дополнительные HuggingFace модели через запятую. "
+                             "Формат: model/id или model/id:Название. "
+                             "Пример: ai-forever/ruBert-base,microsoft/mdeberta-v3-base")
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     parser.add_argument("--llm-api-base", default=None,
