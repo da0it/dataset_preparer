@@ -752,11 +752,19 @@ def _finetune_transformer(
 
     # ── torch.compile() (PyTorch ≥ 2.0, +15–30 % на Ampere/Blackwell) ────────
     if compile_model:
-        if hasattr(torch, "compile"):
-            print("    torch.compile() — компиляция графа (первый батч медленнее)...")
-            model = torch.compile(model)
-        else:
+        if not hasattr(torch, "compile"):
             print("    ПРЕДУПРЕЖДЕНИЕ: torch.compile() требует PyTorch ≥ 2.0, пропуск")
+        else:
+            # Inductor не поддерживает SM >= 120 (Blackwell consumer, RTX 50xx) в текущих билдах
+            _cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+            _sm = _cap[0] * 10 + _cap[1]  # например 8.9 → 89, 12.0 → 120
+            if _sm >= 120:
+                print(f"    ПРЕДУПРЕЖДЕНИЕ: torch.compile(inductor) не поддерживает "
+                      f"SM{_sm} (Blackwell consumer) в PyTorch {torch.__version__}, пропуск. "
+                      "Запускайте без --compile.")
+            else:
+                print("    torch.compile() — компиляция графа (первый батч медленнее)...")
+                model = torch.compile(model)
 
     # ── Weighted loss (class imbalance) ───────────────────────────────────────
     cw = compute_class_weight("balanced", classes=np.arange(num_labels), y=y_tr)
