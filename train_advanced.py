@@ -323,7 +323,7 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
                      sublinear_tf=True, min_df=1)
 
     lr_kw  = dict(max_iter=1000, class_weight="balanced", C=1.0,
-                  solver="lbfgs", multi_class="auto")
+                  solver="lbfgs")
     svm_kw = dict(max_iter=3000, class_weight="balanced", C=1.0)
     rf_kw  = dict(n_estimators=200, class_weight="balanced",
                   random_state=42, n_jobs=-1)
