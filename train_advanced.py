@@ -663,6 +663,9 @@ def _finetune_transformer(
     bf16: bool = False,
     grad_accum: int = 1,
     compile_model: bool = False,
+    freeze_layers: int = 0,
+    label_smoothing: float = 0.0,
+    early_stopping: int = 0,
 ):
     """
     Fine-tuning AutoModelForSequenceClassification (RuBERT или XLM-RoBERTa).
@@ -750,6 +753,22 @@ def _finetune_transformer(
         model_name, num_labels=num_labels, ignore_mismatched_sizes=True
     ).to(device)
 
+    # ── Layer freezing (техника для малых датасетов) ──────────────────────────
+    if freeze_layers > 0:
+        # Заморозить embeddings
+        for param in model.base_model.embeddings.parameters():
+            param.requires_grad = False
+        # Заморозить первые N слоёв энкодера
+        enc_layers = model.base_model.encoder.layer
+        n_freeze = min(freeze_layers, len(enc_layers))
+        for layer in enc_layers[:n_freeze]:
+            for param in layer.parameters():
+                param.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in model.parameters())
+        print(f"    Заморожено: embeddings + {n_freeze}/{len(enc_layers)} слоёв  "
+              f"| Обучаемых параметров: {trainable:,} / {total:,}")
+
     # ── torch.compile() (PyTorch ≥ 2.0, +15–30 % на Ampere/Blackwell) ────────
     if compile_model:
         if not hasattr(torch, "compile"):
@@ -766,11 +785,14 @@ def _finetune_transformer(
                 print("    torch.compile() — компиляция графа (первый батч медленнее)...")
                 model = torch.compile(model)
 
-    # ── Weighted loss (class imbalance) ───────────────────────────────────────
+    # ── Weighted loss + label smoothing ───────────────────────────────────────
     cw = compute_class_weight("balanced", classes=np.arange(num_labels), y=y_tr)
     loss_fn = torch.nn.CrossEntropyLoss(
-        weight=torch.tensor(cw, dtype=torch.float).to(device)
+        weight=torch.tensor(cw, dtype=torch.float).to(device),
+        label_smoothing=label_smoothing,
     )
+    if label_smoothing > 0:
+        print(f"    Label smoothing: {label_smoothing}")
 
     # ── Optimizer + scheduler ─────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -790,6 +812,9 @@ def _finetune_transformer(
     t0 = time.perf_counter()
     best_model_state = None
     best_f1 = -1.0
+    patience_counter = 0
+    if early_stopping > 0:
+        print(f"    Early stopping: patience={early_stopping} эпох")
 
     for epoch in range(epochs):
         model.train()
@@ -846,6 +871,14 @@ def _finetune_transformer(
         if epoch_f1 > best_f1:
             best_f1 = epoch_f1
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            if early_stopping > 0:
+                patience_counter += 1
+                if patience_counter >= early_stopping:
+                    print(f"    Early stopping: нет улучшения {early_stopping} эпох подряд, "
+                          f"лучший val_F1={best_f1:.3f} (epoch {epoch + 1 - early_stopping})")
+                    break
 
     train_sec = time.perf_counter() - t0
 
@@ -901,6 +934,10 @@ def run_transformer_models(
     bf16: bool = False,
     grad_accum: int = 1,
     compile_model: bool = False,
+    lr: float = 2e-5,
+    freeze_layers: int = 0,
+    label_smoothing: float = 0.0,
+    early_stopping: int = 0,
 ):
     """
     3.3.2 Модели на основе трансформеров.
@@ -927,6 +964,10 @@ def run_transformer_models(
             epochs=epochs, batch_size=batch_size,
             fp16=fp16, bf16=bf16, grad_accum=grad_accum,
             compile_model=compile_model,
+            lr=lr,
+            freeze_layers=freeze_layers,
+            label_smoothing=label_smoothing,
+            early_stopping=early_stopping,
         )
 
 
@@ -1246,6 +1287,10 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             bf16=args.bf16,
             grad_accum=args.grad_accum,
             compile_model=args.compile,
+            lr=args.lr,
+            freeze_layers=args.freeze_layers,
+            label_smoothing=args.label_smoothing,
+            early_stopping=args.early_stopping,
         )
 
     # ── 3.3.3 ─────────────────────────────────────────────────────────────────
@@ -1335,6 +1380,17 @@ def main():
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile() — ускорение графа (PyTorch ≥ 2.0, "
                              "первый батч медленнее из-за JIT)")
+    parser.add_argument("--lr", type=float, default=2e-5,
+                        help="Learning rate для трансформеров (default: 2e-5). "
+                             "Для малых датасетов попробуй 1e-5")
+    parser.add_argument("--freeze-layers", type=int, default=0,
+                        help="Заморозить первые N слоёв энкодера (default: 0). "
+                             "Для малых датасетов: 8-10 из 12 слоёв RuBERT")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="Label smoothing [0..1] (default: 0). "
+                             "Рекомендуется 0.1 для малых датасетов")
+    parser.add_argument("--early-stopping", type=int, default=0,
+                        help="Остановить если нет улучшения N эпох подряд (default: 0 = выкл)")
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     parser.add_argument("--llm-api-base", default=None,
