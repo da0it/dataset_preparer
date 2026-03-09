@@ -770,13 +770,19 @@ def _finetune_transformer(
             param.requires_grad = False
         # Заморозить первые N слоёв энкодера
         enc_layers = model.base_model.encoder.layer
-        n_freeze = min(freeze_layers, len(enc_layers))
+        total_layers = len(enc_layers)
+        # Всегда оставляем минимум 2 верхних слоя обучаемыми
+        n_freeze = min(freeze_layers, max(0, total_layers - 2))
+        if n_freeze < freeze_layers:
+            print(f"    ВНИМАНИЕ: модель имеет {total_layers} слоёв, "
+                  f"заморозка скорректирована: {freeze_layers} → {n_freeze} "
+                  f"(оставлено минимум 2 обучаемых слоя)")
         for layer in enc_layers[:n_freeze]:
             for param in layer.parameters():
                 param.requires_grad = False
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total     = sum(p.numel() for p in model.parameters())
-        print(f"    Заморожено: embeddings + {n_freeze}/{len(enc_layers)} слоёв  "
+        print(f"    Заморожено: embeddings + {n_freeze}/{total_layers} слоёв  "
               f"| Обучаемых параметров: {trainable:,} / {total:,}")
 
     # ── torch.compile() (PyTorch ≥ 2.0, +15–30 % на Ampere/Blackwell) ────────
