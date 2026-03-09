@@ -711,7 +711,12 @@ def _finetune_transformer(
     num_labels = len(le.classes_)
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        print(f"\n  [{friendly_name}]  ПРОПУСК — не удалось загрузить токенизатор: {e}")
+        print(f"    Проверьте правильность model id: {model_name}")
+        return
 
     # ── Dataset с динамическим padding (collate_fn) ────────────────────────
     class TextDataset(TorchDataset):
@@ -749,9 +754,14 @@ def _finetune_transformer(
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=num_labels, ignore_mismatched_sizes=True
-    ).to(device)
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, num_labels=num_labels, ignore_mismatched_sizes=True
+        ).to(device)
+    except Exception as e:
+        print(f"\n  [{friendly_name}]  ПРОПУСК — не удалось загрузить модель: {e}")
+        print(f"    Проверьте правильность model id: {model_name}")
+        return
 
     # ── Layer freezing (техника для малых датасетов) ──────────────────────────
     if freeze_layers > 0:
