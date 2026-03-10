@@ -681,7 +681,6 @@ def _finetune_transformer(
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
-    max_length: int = 256,
     save_model: bool = True,
     silent: bool = False,
 ):
@@ -994,9 +993,9 @@ def run_transformer_models(
 
     models = []
     if run_all or "rubert" in (groups or set()):
-        models.append((rubert_model, "RuBERT (fine-tuned)"))
+        models.append((rubert_model, "RuBERT"))
     if run_all or "xlmr" in (groups or set()):
-        models.append((xlmr_model, "XLM-RoBERTa (fine-tuned)"))
+        models.append((xlmr_model, "XLM-RoBERTa"))
 
     # Дополнительные модели из --extra-models
     if extra_models:
