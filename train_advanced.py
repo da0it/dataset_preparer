@@ -899,8 +899,7 @@ def _finetune_transformer(
                 out = model(**enc)
                 preds_epoch.extend(torch.argmax(out.logits, 1).cpu().tolist())
         epoch_f1 = f1_score(y_te, preds_epoch, average="weighted", zero_division=0)
-        if not silent:
-            print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
+        print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
 
         if epoch_f1 > best_f1:
             best_f1 = epoch_f1
