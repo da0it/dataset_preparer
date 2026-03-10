@@ -379,6 +379,7 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
 def run_baseline_models(
     X_train, y_train, X_test, y_test,
     store: ResultStore, output_dir: Path,
+    cv: int = 0,
 ):
     """
     3.2 Базовые алгоритмы классификации.
@@ -391,6 +392,20 @@ def run_baseline_models(
     for name, pipeline in build_baseline_pipelines().items():
         print(f"\n  [{name}]")
         try:
+            # ── Кросс-валидация (опционально) ─────────────────────────────────
+            if cv >= 2:
+                from sklearn.model_selection import StratifiedKFold, cross_val_score
+                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+                # Объединяем train+test для CV по всему датасету
+                X_all = list(X_train) + list(X_test)
+                y_all = list(y_train) + list(y_test)
+                cv_scores = cross_val_score(
+                    pipeline, X_all, y_all,
+                    cv=skf, scoring="f1_weighted", n_jobs=-1
+                )
+                print(f"    CV {cv}-fold F1: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}  "
+                      f"(folds: {', '.join(f'{s:.3f}' for s in cv_scores)})")
+
             t0 = time.perf_counter()
             pipeline.fit(X_train, y_train)
             train_sec = time.perf_counter() - t0
@@ -400,7 +415,7 @@ def run_baseline_models(
             infer_ms = (time.perf_counter() - t1) * 1000
 
             f1 = store.record(name, "baseline", y_test, y_pred, train_sec, infer_ms)
-            print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+            print(f"    Hold-out F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
             print(classification_report(y_test, y_pred, zero_division=0))
 
             save_confusion_matrix(y_test, y_pred, name, output_dir)
@@ -666,6 +681,9 @@ def _finetune_transformer(
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
+    max_length: int = 256,
+    save_model: bool = True,
+    silent: bool = False,
 ):
     """
     Fine-tuning AutoModelForSequenceClassification (RuBERT или XLM-RoBERTa).
@@ -882,7 +900,8 @@ def _finetune_transformer(
                 out = model(**enc)
                 preds_epoch.extend(torch.argmax(out.logits, 1).cpu().tolist())
         epoch_f1 = f1_score(y_te, preds_epoch, average="weighted", zero_division=0)
-        print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
+        if not silent:
+            print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
 
         if epoch_f1 > best_f1:
             best_f1 = epoch_f1
@@ -922,20 +941,25 @@ def _finetune_transformer(
     f1 = store.record(
         friendly_name, "transformers", y_test_orig, y_pred,
         train_sec, infer_ms, notes=model_name,
-    )
-    print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
-    print(classification_report(y_test_orig, y_pred, zero_division=0))
-    save_confusion_matrix(y_test_orig, y_pred, friendly_name, output_dir)
+    ) if not silent else f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
+
+    if not silent:
+        print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+        print(classification_report(y_test_orig, y_pred, zero_division=0))
+        save_confusion_matrix(y_test_orig, y_pred, friendly_name, output_dir)
 
     # ── Save model ────────────────────────────────────────────────────────────
-    safe = (friendly_name.replace(" ", "_").replace("/", "-")
-            .replace("(", "").replace(")", ""))
-    model_out = output_dir / safe
-    model_out.mkdir(exist_ok=True)
-    model.save_pretrained(str(model_out))
-    tokenizer.save_pretrained(str(model_out))
-    joblib.dump(le, model_out / "label_encoder.joblib")
-    print(f"    Сохранено: {model_out.name}/")
+    if save_model and not silent:
+        safe = (friendly_name.replace(" ", "_").replace("/", "-")
+                .replace("(", "").replace(")", ""))
+        model_out = output_dir / safe
+        model_out.mkdir(exist_ok=True)
+        model.save_pretrained(str(model_out))
+        tokenizer.save_pretrained(str(model_out))
+        joblib.dump(le, model_out / "label_encoder.joblib")
+        print(f"    Сохранено: {model_out.name}/")
+
+    return f1
 
 
 def run_transformer_models(
@@ -955,6 +979,8 @@ def run_transformer_models(
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
     extra_models: list = None,
+    max_length: int = 256,
+    cv: int = 0,
 ):
     """
     3.3.2 Модели на основе трансформеров.
@@ -985,19 +1011,53 @@ def run_transformer_models(
                 m_name = entry.split("/")[-1]  # короткое имя из HF path
             models.append((entry.split(":")[0].strip(), m_name.strip()))
 
+    # Общие kwargs для _finetune_transformer
+    _ft_kwargs = dict(
+        store=store, output_dir=output_dir,
+        epochs=epochs, batch_size=batch_size,
+        fp16=fp16, bf16=bf16, grad_accum=grad_accum,
+        compile_model=compile_model, lr=lr,
+        freeze_layers=freeze_layers, label_smoothing=label_smoothing,
+        early_stopping=early_stopping, max_length=max_length,
+    )
+
     for model_id, name in models:
+
+        # ── Кросс-валидация ───────────────────────────────────────────────────
+        if cv >= 2:
+            from sklearn.model_selection import StratifiedKFold
+            X_all = np.array(list(X_train) + list(X_test))
+            y_all = np.array(list(y_train) + list(y_test))
+            skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+            fold_scores = []
+            print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
+            for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
+                print(f"    — Фолд {fold_idx + 1}/{cv}  "
+                      f"(train={len(tr_idx)}, val={len(val_idx)})")
+                fold_f1 = _finetune_transformer(
+                    model_name=model_id, friendly_name=f"{name} fold{fold_idx+1}",
+                    X_train=X_all[tr_idx], y_train=y_all[tr_idx],
+                    X_test=X_all[val_idx],  y_test=y_all[val_idx],
+                    save_model=False, silent=True,
+                    **_ft_kwargs,
+                )
+                if fold_f1 is not None:
+                    fold_scores.append(fold_f1)
+                    print(f"      F1 = {fold_f1:.3f}")
+            if fold_scores:
+                mean_f1 = np.mean(fold_scores)
+                std_f1  = np.std(fold_scores)
+                folds_str = ", ".join(f"{s:.3f}" for s in fold_scores)
+                print(f"    CV F1: {mean_f1:.3f} ± {std_f1:.3f}  "
+                      f"(фолды: {folds_str})")
+
+        # ── Финальное обучение на полном train-сете ───────────────────────────
         _finetune_transformer(
             model_name=model_id, friendly_name=name,
             X_train=X_train, y_train=y_train,
             X_test=X_test, y_test=y_test,
-            store=store, output_dir=output_dir,
-            epochs=epochs, batch_size=batch_size,
-            fp16=fp16, bf16=bf16, grad_accum=grad_accum,
-            compile_model=compile_model,
-            lr=lr,
-            freeze_layers=freeze_layers,
-            label_smoothing=label_smoothing,
-            early_stopping=early_stopping,
+            save_model=True, silent=False,
+            **_ft_kwargs,
         )
 
 
@@ -1293,7 +1353,8 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
 
     # ── 3.2 ──────────────────────────────────────────────────────────────────
     if run_all or "baseline" in groups:
-        run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir)
+        run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir,
+                            cv=args.cv)
 
     # ── 3.3.1 ─────────────────────────────────────────────────────────────────
     embedding_groups = {"embeddings", "word2vec", "doc2vec", "fasttext", "sbert"}
@@ -1322,6 +1383,8 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             label_smoothing=args.label_smoothing,
             early_stopping=args.early_stopping,
             extra_models=args.extra_models,
+            max_length=args.max_length,
+            cv=args.cv,
         )
 
     # ── 3.3.3 ─────────────────────────────────────────────────────────────────
@@ -1422,6 +1485,13 @@ def main():
                              "Рекомендуется 0.1 для малых датасетов")
     parser.add_argument("--early-stopping", type=int, default=0,
                         help="Остановить если нет улучшения N эпох подряд (default: 0 = выкл)")
+    parser.add_argument("--max-length", type=int, default=256,
+                        help="Макс. длина последовательности для трансформеров (default: 256, "
+                             "макс: 512). Увеличение до 512 захватывает больше контекста, "
+                             "но требует больше VRAM и замедляет обучение")
+    parser.add_argument("--cv", type=int, default=0,
+                        help="Кросс-валидация для baseline моделей: число фолдов (default: 0 = выкл). "
+                             "Рекомендуется 5 для малых датасетов")
     parser.add_argument("--extra-models", type=lambda s: s.split(","), default=None,
                         help="Дополнительные HuggingFace модели через запятую. "
                              "Формат: model/id или model/id:Название. "
