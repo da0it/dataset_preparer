@@ -10,6 +10,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
   3.3.1 Эмбеддинги : Word2Vec, Doc2Vec, fastText, SentenceTransformers (SBERT)
   3.3.2 Трансформеры: RuBERT, XLM-RoBERTa (fine-tuning)
   3.3.3 LLM        : zero-shot, few-shot (OpenAI-совместимый API / Ollama)
+  3.3.4 CNN/RNN
 
 Секция 3.4  Сравнительный анализ — таблица метрик + графики
 
@@ -426,6 +427,7 @@ def run_baseline_models(
 
         except Exception as exc:
             print(f"    ОШИБКА: {exc}")
+
 
 
 # ==============================================================================
@@ -1247,6 +1249,174 @@ def run_llm_models(
     )
 
 
+
+# 3.3.4. CNN
+def run_cnn_models(
+    X_train, y_train, X_test, y_test,
+    store: ResultStore, output_dir: Path,
+    embedding_dim=100,
+    num_filters=100,
+    filter_sizes=[3, 4, 5],
+    batch_size=32,
+    epochs=10,
+    max_words=5000,
+    max_length=200,
+    use_pretrained=False
+):
+    """
+    CNN для классификации текстов.
+    """
+    print(f"\n{'═' * 60}")
+    print("  3.3.4  CNN (сверточные нейросети)")
+    print(f"{'═' * 60}")
+    
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.preprocessing.text import Tokenizer
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
+        from tensorflow.keras.utils import to_categorical
+        from sklearn.preprocessing import LabelEncoder
+    except ImportError:
+        print("  ПРОПУСК — tensorflow не установлен")
+        print("  Установка: pip install tensorflow")
+        return
+    
+    # Подготовка данных
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(y_train)
+    y_test_enc = le.transform(y_test)
+    num_classes = len(le.classes_)
+    
+    # Токенизация
+    tokenizer = Tokenizer(num_words=max_words)
+    tokenizer.fit_on_texts(X_train)
+    
+    X_train_seq = tokenizer.texts_to_sequences(X_train)
+    X_test_seq = tokenizer.texts_to_sequences(X_test)
+    
+    X_train_pad = pad_sequences(X_train_seq, maxlen=max_length, padding='post')
+    X_test_pad = pad_sequences(X_test_seq, maxlen=max_length, padding='post')
+    
+    # One-hot encoding для лейблов
+    y_train_cat = to_categorical(y_train_enc, num_classes)
+    y_test_cat = to_categorical(y_test_enc, num_classes)
+    
+    # Создание модели
+    model = tf.keras.Sequential([
+        # Embedding слой
+        tf.keras.layers.Embedding(
+            max_words,
+            embedding_dim,
+            input_length=max_length,
+            trainable=True
+        ),
+        # Reshape для Conv1D
+        tf.keras.layers.Reshape((max_length, embedding_dim, 1)),
+        
+        # Несколько сверточных слоев с разными размерами фильтров
+        tf.keras.layers.Conv2D(num_filters, (3, embedding_dim), activation='relu'),
+        tf.keras.layers.MaxPooling2D((max_length - 3 + 1, 1)),
+        
+        tf.keras.layers.Conv2D(num_filters, (4, embedding_dim), activation='relu'),
+        tf.keras.layers.MaxPooling2D((max_length - 4 + 1, 1)),
+        
+        tf.keras.layers.Conv2D(num_filters, (5, embedding_dim), activation='relu'),
+        tf.keras.layers.MaxPooling2D((max_length - 5 + 1, 1)),
+        
+        # Объединение и классификация
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(num_classes, activation='softmax')
+    ])
+    
+    # Компиляция
+    model.compile(
+        optimizer='adam',
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    print(f"\n  Архитектура CNN:")
+    print(f"    Embedding dim: {embedding_dim}")
+    print(f"    Фильтры: {num_filters} x {filter_sizes}")
+    print(f"    Max words: {max_words}")
+    print(f"    Max length: {max_length}")
+    print(f"    Параметров: {model.count_params():,}")
+    
+    # Callbacks
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=3,
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=2
+        )
+    ]
+    
+    # Обучение
+    t0 = time.perf_counter()
+    history = model.fit(
+        X_train_pad, y_train_cat,
+        validation_split=0.1,
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=1
+    )
+    train_sec = time.perf_counter() - t0
+    
+    # Инференс
+    t1 = time.perf_counter()
+    y_pred_proba = model.predict(X_test_pad, verbose=0)
+    y_pred = le.inverse_transform(np.argmax(y_pred_proba, axis=1))
+    infer_ms = (time.perf_counter() - t1) * 1000
+    
+    # Сохранение результатов
+    f1 = store.record(
+        f"CNN (emb={embedding_dim}, filters={num_filters})",
+        "embeddings",  # или создать новую группу "cnn"
+        y_test, y_pred,
+        train_sec, infer_ms,
+        notes=f"epochs={len(history.history['loss'])}"
+    )
+    
+    print(f"\n    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
+    print(classification_report(y_test, y_pred, zero_division=0))
+    
+    # Визуализация обучения
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    ax1.plot(history.history['loss'], label='Train')
+    ax1.plot(history.history['val_loss'], label='Validation')
+    ax1.set_title('Model Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    
+    ax2.plot(history.history['accuracy'], label='Train')
+    ax2.plot(history.history['val_accuracy'], label='Validation')
+    ax2.set_title('Model Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'cnn_training_history.png')
+    plt.close()
+    
+    # Сохранение модели
+    model.save(output_dir / 'cnn_model.h5')
+    joblib.dump(tokenizer, output_dir / 'cnn_tokenizer.joblib')
+    joblib.dump(le, output_dir / 'cnn_label_encoder.joblib')
+    
+    save_confusion_matrix(y_test, y_pred, "CNN", output_dir)
+
 # ==============================================================================
 # SECTION 3.4 — СРАВНИТЕЛЬНЫЙ АНАЛИЗ МОДЕЛЕЙ
 # ==============================================================================
@@ -1400,6 +1570,18 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
                 max_samples=args.llm_max_samples,
             )
 
+    if run_all or "cnn" in groups:
+        run_cnn_models(
+            X_train, y_train, X_test, y_test, store, target_dir,
+            embedding_dim=args.cnn_embed_dim,
+            num_filters=args.cnn_filters,
+            filter_sizes=[int(x) for x in args.cnn_filter_sizes.split(",")],
+            max_words=args.cnn_max_words,
+            max_length=args.cnn_max_length,
+            epochs=args.epochs,  # можно переиспользовать
+            batch_size=args.batch_size
+    )
+
     # ── 3.4 ──────────────────────────────────────────────────────────────────
     if store.records:
         generate_comparison_report(store, target_dir, target)
@@ -1506,6 +1688,19 @@ def main():
                         help="Примеров на класс для few-shot (default: 3)")
     parser.add_argument("--llm-max-samples", type=int, default=200,
                         help="Макс. число тестовых примеров для LLM (default: 200)")
+    
+
+    # -- CNN ---------------------------
+    parser.add_argument("--cnn-embed-dim", type=int, default=100,
+                    help="Размерность эмбеддингов для CNN (default: 100)")
+    parser.add_argument("--cnn-filters", type=int, default=100,
+                        help="Количество фильтров в CNN (default: 100)")
+    parser.add_argument("--cnn-filter-sizes", default="3,4,5",
+                        help="Размеры фильтров через запятую (default: 3,4,5)")
+    parser.add_argument("--cnn-max-words", type=int, default=5000,
+                        help="Максимальный размер словаря (default: 5000)")
+    parser.add_argument("--cnn-max-length", type=int, default=200,
+                    help="Максимальная длина последовательности (default: 200)")
 
     args = parser.parse_args()
 
