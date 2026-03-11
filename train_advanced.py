@@ -1276,7 +1276,7 @@ def _build_textcnn(num_classes, max_words, max_length, embedding_dim, num_filter
     branches = []
     for fs in filter_sizes:
         c = tf.keras.layers.Conv1D(
-            num_filters, fs, activation="relu", padding="valid", name=f"conv_fs{fs}"
+            num_filters, fs, activation="relu", padding="same", name=f"conv_fs{fs}"
         )(emb)
         p = tf.keras.layers.GlobalMaxPooling1D(name=f"pool_fs{fs}")(c)
         branches.append(p)
@@ -1521,58 +1521,63 @@ def run_cnn_models(
         sep = "─" * max(0, 50 - len(short))
         print(f"\n  ── {short} {sep}")
 
-        model = builder()
-        model.compile(
-            optimizer="adam",
-            loss="categorical_crossentropy",
-            metrics=["accuracy"],
-        )
-        print(f"     Параметров: {model.count_params():,}")
+        try:
+            model = builder()
+            model.compile(
+                optimizer="adam",
+                loss="categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+            print(f"     Параметров: {model.count_params():,}")
 
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor="val_loss", patience=3, restore_best_weights=True
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_loss", factor=0.5, patience=2, verbose=0
-            ),
-        ]
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_loss", patience=3, restore_best_weights=True
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor="val_loss", factor=0.5, patience=2, verbose=0
+                ),
+            ]
 
-        t0 = time.perf_counter()
-        history = model.fit(
-            X_train_pad, y_train_cat,
-            validation_split=0.1,
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=0,
-        )
-        train_sec = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            history = model.fit(
+                X_train_pad, y_train_cat,
+                validation_split=0.1,
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=callbacks,
+                verbose=0,
+            )
+            train_sec = time.perf_counter() - t0
 
-        t1 = time.perf_counter()
-        y_pred_proba = model.predict(X_test_pad, verbose=0)
-        infer_ms = (time.perf_counter() - t1) * 1000
+            t1 = time.perf_counter()
+            y_pred_proba = model.predict(X_test_pad, verbose=0)
+            infer_ms = (time.perf_counter() - t1) * 1000
 
-        y_pred = le.inverse_transform(np.argmax(y_pred_proba, axis=1))
+            y_pred = le.inverse_transform(np.argmax(y_pred_proba, axis=1))
 
-        f1 = store.record(
-            label, group, y_test, y_pred, train_sec, infer_ms,
-            notes=f"epochs_run={len(history.history['loss'])}",
-        )
-        print(f"     F1: {f1:.3f}  |  Train: {train_sec:.1f}s  "
-              f"|  Эпох: {len(history.history['loss'])}")
-        print(classification_report(y_test, y_pred, zero_division=0))
+            f1 = store.record(
+                label, group, y_test, y_pred, train_sec, infer_ms,
+                notes=f"epochs_run={len(history.history['loss'])}",
+            )
+            print(f"     F1: {f1:.3f}  |  Train: {train_sec:.1f}s  "
+                  f"|  Эпох: {len(history.history['loss'])}")
+            print(classification_report(y_test, y_pred, zero_division=0))
 
-        all_histories[short] = history.history
+            all_histories[short] = history.history
 
-        safe_name = re.sub(r"[^\w]+", "_", short).strip("_")
-        save_confusion_matrix(y_test, y_pred, label, output_dir)
+            safe_name = re.sub(r"[^\w]+", "_", short).strip("_")
+            save_confusion_matrix(y_test, y_pred, label, output_dir)
 
-        model_path = output_dir / f"{safe_name}_model.keras"
-        model.save(str(model_path))
+            model_path = output_dir / f"{safe_name}_model.keras"
+            model.save(str(model_path))
 
-        # Освобождаем память графа Keras
-        tf.keras.backend.clear_session()
+        except Exception as exc:
+            print(f"     ПРОПУСК — ошибка при обучении {short}: {exc}")
+
+        finally:
+            # Освобождаем память графа Keras независимо от результата
+            tf.keras.backend.clear_session()
 
     # ── Общий график истории обучения ────────────────────────────────────────
     n = len(all_histories)
