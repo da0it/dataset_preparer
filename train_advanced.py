@@ -103,6 +103,7 @@ RESOURCE_MAP = {
     "embeddings":   "средние",
     "transformers": "высокие",
     "llm":          "очень высокие",
+    "cnn":          "средние", 
 }
 
 
@@ -257,6 +258,7 @@ def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
         "embeddings":   "#55A868",
         "transformers": "#C44E52",
         "llm":          "#8172B2",
+        "cnn":          "#FFA07A",
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(df) * 0.5 + 2)))
@@ -1380,7 +1382,7 @@ def run_cnn_models(
     # Сохранение результатов
     f1 = store.record(
         f"CNN (emb={embedding_dim}, filters={num_filters})",
-        "embeddings",  # или создать новую группу "cnn"
+        "cnn",   # или создать новую группу "cnn"
         y_test, y_pred,
         train_sec, infer_ms,
         notes=f"epochs={len(history.history['loss'])}"
@@ -1569,8 +1571,8 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
                 target_desc=_TARGET_DESCRIPTIONS.get(target, target),
                 max_samples=args.llm_max_samples,
             )
-
-    if run_all or "cnn" in groups:
+    cnn_groups = {"cnn"}
+    if run_all or groups & "cnn" in groups:
         run_cnn_models(
             X_train, y_train, X_test, y_test, store, target_dir,
             embedding_dim=args.cnn_embed_dim,
@@ -1604,6 +1606,7 @@ def main():
   rubert       — RuBERT fine-tuning (требует transformers + torch)
   xlmr         — XLM-RoBERTa fine-tuning
   transformers — rubert + xlmr вместе
+  cnn          — сверточная нейросеть (требует tensorflow)
   llm          — zero-shot + few-shot через OpenAI-совместимый API
   all          — все группы
 
