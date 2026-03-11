@@ -10,7 +10,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
   3.3.1 Эмбеддинги : Word2Vec, Doc2Vec, fastText, SentenceTransformers (SBERT)
   3.3.2 Трансформеры: RuBERT, XLM-RoBERTa (fine-tuning)
   3.3.3 LLM        : zero-shot, few-shot (OpenAI-совместимый API / Ollama)
-  3.3.4 CNN/RNN
+  3.3.4 CNN/RNN    : TextCNN, StackedCNN, DPCNN, CNN-BiLSTM, BiLSTM, BiGRU, BiLSTM+Attention
 
 Секция 3.4  Сравнительный анализ — таблица метрик + графики
 
@@ -53,6 +53,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
 
 import argparse
 import json
+import re
 import sys
 import time
 import warnings
@@ -103,7 +104,8 @@ RESOURCE_MAP = {
     "embeddings":   "средние",
     "transformers": "высокие",
     "llm":          "очень высокие",
-    "cnn":          "средние", 
+    "cnn":          "средние",
+    "rnn":          "средние",
 }
 
 
@@ -1252,7 +1254,146 @@ def run_llm_models(
 
 
 
-# 3.3.4. CNN
+# 3.3.4. CNN / RNN (глубокое обучение)
+# ──────────────────────────────────────────────────────────────────────────────
+# Архитектуры:
+#   1. TextCNN          — Kim (2014), параллельные Conv1D с разными фильтрами
+#   2. StackedCNN       — глубокая многослойная CNN
+#   3. DPCNN            — Deep Pyramid CNN (Johnson & Zhang, 2017)
+#   4. CNN-BiLSTM       — гибрид: свёртка + двунаправленный LSTM
+#   5. BiLSTM           — двунаправленный LSTM
+#   6. BiGRU            — двунаправленный GRU
+#   7. BiLSTM+Attention — BiLSTM с механизмом мягкого внимания
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _build_textcnn(num_classes, max_words, max_length, embedding_dim, num_filters, filter_sizes):
+    """TextCNN: Kim (2014). Параллельные Conv1D с разными размерами ядра."""
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,), name="input")
+    emb = tf.keras.layers.Embedding(max_words, embedding_dim, name="embedding")(inputs)
+
+    branches = []
+    for fs in filter_sizes:
+        c = tf.keras.layers.Conv1D(
+            num_filters, fs, activation="relu", padding="valid", name=f"conv_fs{fs}"
+        )(emb)
+        p = tf.keras.layers.GlobalMaxPooling1D(name=f"pool_fs{fs}")(c)
+        branches.append(p)
+
+    x = tf.keras.layers.Concatenate(name="concat")(branches) if len(branches) > 1 else branches[0]
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(128, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="TextCNN")
+
+
+def _build_stacked_cnn(num_classes, max_words, max_length, embedding_dim, num_filters):
+    """StackedCNN: несколько слоёв Conv1D с нарастающей шириной фильтров."""
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+    x = tf.keras.layers.Conv1D(num_filters, 3, activation="relu", padding="same")(x)
+    x = tf.keras.layers.Conv1D(num_filters, 3, activation="relu", padding="same")(x)
+    x = tf.keras.layers.MaxPooling1D(2)(x)
+    x = tf.keras.layers.Conv1D(num_filters * 2, 3, activation="relu", padding="same")(x)
+    x = tf.keras.layers.Conv1D(num_filters * 2, 3, activation="relu", padding="same")(x)
+    x = tf.keras.layers.GlobalMaxPooling1D()(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(128, activation="relu")(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="StackedCNN")
+
+
+def _build_dpcnn(num_classes, max_words, max_length, embedding_dim, num_filters, num_blocks=3):
+    """DPCNN: Deep Pyramid CNN (Johnson & Zhang, 2017).
+    Пирамидальное downsampling с residual-соединениями — позволяет строить
+    очень глубокие сети без исчезающего градиента.
+    """
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+
+    # Region embedding
+    x = tf.keras.layers.Conv1D(num_filters, 3, padding="same", activation="relu")(x)
+
+    for _ in range(num_blocks):
+        shortcut = x
+        x = tf.keras.layers.Conv1D(num_filters, 3, padding="same", activation="relu")(x)
+        x = tf.keras.layers.Conv1D(num_filters, 3, padding="same", activation="relu")(x)
+        x = tf.keras.layers.Add()([x, shortcut])
+        x = tf.keras.layers.MaxPooling1D(pool_size=3, strides=2, padding="same")(x)
+
+    x = tf.keras.layers.GlobalMaxPooling1D()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="DPCNN")
+
+
+def _build_cnn_bilstm(num_classes, max_words, max_length, embedding_dim, num_filters, lstm_units):
+    """CNN-BiLSTM: свёртка выделяет локальные n-граммные паттерны,
+    BiLSTM улавливает дальние зависимости в тексте.
+    """
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+    x = tf.keras.layers.Conv1D(num_filters, 5, activation="relu", padding="same")(x)
+    x = tf.keras.layers.MaxPooling1D(2)(x)
+    x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(lstm_units))(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="CNN_BiLSTM")
+
+
+def _build_bilstm(num_classes, max_words, max_length, embedding_dim, lstm_units):
+    """BiLSTM: двунаправленный LSTM — классический baseline рекуррентных сетей."""
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+    x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(lstm_units))(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="BiLSTM")
+
+
+def _build_bigru(num_classes, max_words, max_length, embedding_dim, gru_units):
+    """BiGRU: двунаправленный GRU — быстрее LSTM, часто сравнимое качество."""
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+    x = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(gru_units))(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="BiGRU")
+
+
+def _build_bilstm_attention(num_classes, max_words, max_length, embedding_dim, lstm_units):
+    """BiLSTM+Attention: мягкое внимание (Bahdanau) над выходами BiLSTM.
+    Позволяет модели явно взвешивать релевантные позиции текста.
+    """
+    import tensorflow as tf
+    inputs = tf.keras.Input(shape=(max_length,))
+    x = tf.keras.layers.Embedding(max_words, embedding_dim)(inputs)
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.LSTM(lstm_units, return_sequences=True)
+    )(x)
+    # Bahdanau-style self-attention
+    e = tf.keras.layers.Dense(1, activation="tanh")(x)           # (B, T, 1)
+    a = tf.keras.layers.Softmax(axis=1)(e)                        # (B, T, 1)
+    x = tf.keras.layers.Multiply()([x, a])                        # (B, T, 2*H)
+    x = tf.keras.layers.Lambda(
+        lambda z: tf.reduce_sum(z, axis=1), name="att_sum"
+    )(x)                                                           # (B, 2*H)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    out = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, out, name="BiLSTM_Attention")
+
+
 def run_cnn_models(
     X_train, y_train, X_test, y_test,
     store: ResultStore, output_dir: Path,
@@ -1263,15 +1404,24 @@ def run_cnn_models(
     epochs=10,
     max_words=5000,
     max_length=200,
-    use_pretrained=False
+    use_pretrained=False,
 ):
     """
-    CNN для классификации текстов.
+    3.3.4  CNN / RNN — сравнительное обучение 7 архитектур глубокого обучения.
+
+    Модели:
+      TextCNN          — Kim (2014), параллельные Conv1D
+      StackedCNN       — глубокая многослойная свёртка
+      DPCNN            — Deep Pyramid CNN с residual
+      CNN-BiLSTM       — гибрид свёрток и BiLSTM
+      BiLSTM           — двунаправленный LSTM
+      BiGRU            — двунаправленный GRU
+      BiLSTM+Attention — BiLSTM + мягкое внимание
     """
     print(f"\n{'═' * 60}")
-    print("  3.3.4  CNN (сверточные нейросети)")
+    print("  3.3.4  CNN / RNN (сверточные и рекуррентные нейросети)")
     print(f"{'═' * 60}")
-    
+
     try:
         import tensorflow as tf
         from tensorflow.keras.preprocessing.text import Tokenizer
@@ -1282,142 +1432,179 @@ def run_cnn_models(
         print("  ПРОПУСК — tensorflow не установлен")
         print("  Установка: pip install tensorflow")
         return
-    
-    # Подготовка данных
+
+    # ── Подготовка данных (один раз для всех моделей) ──────────────────────
     le = LabelEncoder()
     y_train_enc = le.fit_transform(y_train)
-    y_test_enc = le.transform(y_test)
+    y_test_enc  = le.transform(y_test)
     num_classes = len(le.classes_)
-    
-    # Токенизация
+
     tokenizer = Tokenizer(num_words=max_words)
     tokenizer.fit_on_texts(X_train)
-    
+
     X_train_seq = tokenizer.texts_to_sequences(X_train)
-    X_test_seq = tokenizer.texts_to_sequences(X_test)
-    
-    X_train_pad = pad_sequences(X_train_seq, maxlen=max_length, padding='post')
-    X_test_pad = pad_sequences(X_test_seq, maxlen=max_length, padding='post')
-    
-    # One-hot encoding для лейблов
+    X_test_seq  = tokenizer.texts_to_sequences(X_test)
+
+    X_train_pad = pad_sequences(X_train_seq, maxlen=max_length, padding="post")
+    X_test_pad  = pad_sequences(X_test_seq,  maxlen=max_length, padding="post")
+
     y_train_cat = to_categorical(y_train_enc, num_classes)
-    y_test_cat = to_categorical(y_test_enc, num_classes)
-    
-    # Создание модели
-    model = tf.keras.Sequential([
-        # Embedding слой
-        tf.keras.layers.Embedding(
-            max_words,
-            embedding_dim,
-            input_length=max_length,
-            trainable=True
+
+    lstm_units = max(64, num_filters)
+
+    print(f"\n  Параметры подготовки данных:")
+    print(f"    Словарь      : {max_words} слов")
+    print(f"    Макс. длина  : {max_length} токенов")
+    print(f"    Эмбеддинг    : {embedding_dim}")
+    print(f"    Фильтры/LSTM : {num_filters} / {lstm_units}")
+    print(f"    Классов      : {num_classes}")
+
+    # ── Список архитектур ───────────────────────────────────────────────────
+    # Каждый элемент: (label, group_tag, builder_callable)
+    architectures = [
+        (
+            f"TextCNN (emb={embedding_dim}, filters={num_filters}x{filter_sizes})",
+            "cnn",
+            lambda: _build_textcnn(
+                num_classes, max_words, max_length, embedding_dim, num_filters, filter_sizes
+            ),
         ),
-        # Reshape для Conv1D
-        tf.keras.layers.Reshape((max_length, embedding_dim, 1)),
-        
-        # Несколько сверточных слоев с разными размерами фильтров
-        tf.keras.layers.Conv2D(num_filters, (3, embedding_dim), activation='relu'),
-        tf.keras.layers.MaxPooling2D((max_length - 3 + 1, 1)),
-        
-        tf.keras.layers.Conv2D(num_filters, (4, embedding_dim), activation='relu'),
-        tf.keras.layers.MaxPooling2D((max_length - 4 + 1, 1)),
-        
-        tf.keras.layers.Conv2D(num_filters, (5, embedding_dim), activation='relu'),
-        tf.keras.layers.MaxPooling2D((max_length - 5 + 1, 1)),
-        
-        # Объединение и классификация
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dropout(0.5),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dropout(0.3),
-        tf.keras.layers.Dense(num_classes, activation='softmax')
-    ])
-    
-    # Компиляция
-    model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    print(f"\n  Архитектура CNN:")
-    print(f"    Embedding dim: {embedding_dim}")
-    print(f"    Фильтры: {num_filters} x {filter_sizes}")
-    print(f"    Max words: {max_words}")
-    print(f"    Max length: {max_length}")
-    print(f"    Параметров: {model.count_params():,}")
-    
-    # Callbacks
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=3,
-            restore_best_weights=True
+        (
+            f"StackedCNN (emb={embedding_dim}, filters={num_filters})",
+            "cnn",
+            lambda: _build_stacked_cnn(
+                num_classes, max_words, max_length, embedding_dim, num_filters
+            ),
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=2
-        )
+        (
+            f"DPCNN (emb={embedding_dim}, filters={num_filters})",
+            "cnn",
+            lambda: _build_dpcnn(
+                num_classes, max_words, max_length, embedding_dim, num_filters
+            ),
+        ),
+        (
+            f"CNN-BiLSTM (filters={num_filters}, lstm={lstm_units})",
+            "cnn",
+            lambda: _build_cnn_bilstm(
+                num_classes, max_words, max_length, embedding_dim, num_filters, lstm_units
+            ),
+        ),
+        (
+            f"BiLSTM (units={lstm_units})",
+            "rnn",
+            lambda: _build_bilstm(
+                num_classes, max_words, max_length, embedding_dim, lstm_units
+            ),
+        ),
+        (
+            f"BiGRU (units={lstm_units})",
+            "rnn",
+            lambda: _build_bigru(
+                num_classes, max_words, max_length, embedding_dim, lstm_units
+            ),
+        ),
+        (
+            f"BiLSTM+Attention (units={lstm_units})",
+            "rnn",
+            lambda: _build_bilstm_attention(
+                num_classes, max_words, max_length, embedding_dim, lstm_units
+            ),
+        ),
     ]
-    
-    # Обучение
-    t0 = time.perf_counter()
-    history = model.fit(
-        X_train_pad, y_train_cat,
-        validation_split=0.1,
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        verbose=1
-    )
-    train_sec = time.perf_counter() - t0
-    
-    # Инференс
-    t1 = time.perf_counter()
-    y_pred_proba = model.predict(X_test_pad, verbose=0)
-    y_pred = le.inverse_transform(np.argmax(y_pred_proba, axis=1))
-    infer_ms = (time.perf_counter() - t1) * 1000
-    
-    # Сохранение результатов
-    f1 = store.record(
-        f"CNN (emb={embedding_dim}, filters={num_filters})",
-        "cnn",   # или создать новую группу "cnn"
-        y_test, y_pred,
-        train_sec, infer_ms,
-        notes=f"epochs={len(history.history['loss'])}"
-    )
-    
-    print(f"\n    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
-    print(classification_report(y_test, y_pred, zero_division=0))
-    
-    # Визуализация обучения
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    
-    ax1.plot(history.history['loss'], label='Train')
-    ax1.plot(history.history['val_loss'], label='Validation')
-    ax1.set_title('Model Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.legend()
-    
-    ax2.plot(history.history['accuracy'], label='Train')
-    ax2.plot(history.history['val_accuracy'], label='Validation')
-    ax2.set_title('Model Accuracy')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy')
-    ax2.legend()
-    
+
+    # ── Обучение и оценка каждой архитектуры ────────────────────────────────
+    all_histories: dict[str, dict] = {}
+
+    for label, group, builder in architectures:
+        short = label.split(" (")[0]
+        sep = "─" * max(0, 50 - len(short))
+        print(f"\n  ── {short} {sep}")
+
+        model = builder()
+        model.compile(
+            optimizer="adam",
+            loss="categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        print(f"     Параметров: {model.count_params():,}")
+
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=3, restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=2, verbose=0
+            ),
+        ]
+
+        t0 = time.perf_counter()
+        history = model.fit(
+            X_train_pad, y_train_cat,
+            validation_split=0.1,
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=0,
+        )
+        train_sec = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        y_pred_proba = model.predict(X_test_pad, verbose=0)
+        infer_ms = (time.perf_counter() - t1) * 1000
+
+        y_pred = le.inverse_transform(np.argmax(y_pred_proba, axis=1))
+
+        f1 = store.record(
+            label, group, y_test, y_pred, train_sec, infer_ms,
+            notes=f"epochs_run={len(history.history['loss'])}",
+        )
+        print(f"     F1: {f1:.3f}  |  Train: {train_sec:.1f}s  "
+              f"|  Эпох: {len(history.history['loss'])}")
+        print(classification_report(y_test, y_pred, zero_division=0))
+
+        all_histories[short] = history.history
+
+        safe_name = re.sub(r"[^\w]+", "_", short).strip("_")
+        save_confusion_matrix(y_test, y_pred, label, output_dir)
+
+        model_path = output_dir / f"{safe_name}_model.keras"
+        model.save(str(model_path))
+
+        # Освобождаем память графа Keras
+        tf.keras.backend.clear_session()
+
+    # ── Общий график истории обучения ────────────────────────────────────────
+    n = len(all_histories)
+    fig, axes = plt.subplots(n, 2, figsize=(14, 4 * n))
+    if n == 1:
+        axes = [axes]
+
+    for ax_row, (lbl, hist) in zip(axes, all_histories.items()):
+        ax_row[0].plot(hist.get("loss", []), label="Train")
+        ax_row[0].plot(hist.get("val_loss", []), label="Val")
+        ax_row[0].set_title(f"{lbl} — Loss")
+        ax_row[0].set_xlabel("Epoch")
+        ax_row[0].set_ylabel("Loss")
+        ax_row[0].legend()
+
+        ax_row[1].plot(hist.get("accuracy", []), label="Train")
+        ax_row[1].plot(hist.get("val_accuracy", []), label="Val")
+        ax_row[1].set_title(f"{lbl} — Accuracy")
+        ax_row[1].set_xlabel("Epoch")
+        ax_row[1].set_ylabel("Accuracy")
+        ax_row[1].legend()
+
     plt.tight_layout()
-    plt.savefig(output_dir / 'cnn_training_history.png')
+    plt.savefig(output_dir / "cnn_rnn_training_history.png", dpi=80)
     plt.close()
-    
-    # Сохранение модели
-    model.save(output_dir / 'cnn_model.h5')
-    joblib.dump(tokenizer, output_dir / 'cnn_tokenizer.joblib')
-    joblib.dump(le, output_dir / 'cnn_label_encoder.joblib')
-    
-    save_confusion_matrix(y_test, y_pred, "CNN", output_dir)
+
+    # Общие артефакты
+    joblib.dump(tokenizer, output_dir / "deep_tokenizer.joblib")
+    joblib.dump(le,        output_dir / "deep_label_encoder.joblib")
+
+    print(f"\n  График обучения : cnn_rnn_training_history.png")
+    print(f"  Токенизатор     : deep_tokenizer.joblib")
 
 # ==============================================================================
 # SECTION 3.4 — СРАВНИТЕЛЬНЫЙ АНАЛИЗ МОДЕЛЕЙ
@@ -1571,8 +1758,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
                 target_desc=_TARGET_DESCRIPTIONS.get(target, target),
                 max_samples=args.llm_max_samples,
             )
-    cnn_groups = {"cnn"}
-    if run_all or groups & "cnn" in groups:
+    if run_all or "cnn" in groups:
         run_cnn_models(
             X_train, y_train, X_test, y_test, store, target_dir,
             embedding_dim=args.cnn_embed_dim,
@@ -1580,9 +1766,9 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             filter_sizes=[int(x) for x in args.cnn_filter_sizes.split(",")],
             max_words=args.cnn_max_words,
             max_length=args.cnn_max_length,
-            epochs=args.epochs,  # можно переиспользовать
-            batch_size=args.batch_size
-    )
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+        )
 
     # ── 3.4 ──────────────────────────────────────────────────────────────────
     if store.records:
@@ -1606,7 +1792,8 @@ def main():
   rubert       — RuBERT fine-tuning (требует transformers + torch)
   xlmr         — XLM-RoBERTa fine-tuning
   transformers — rubert + xlmr вместе
-  cnn          — сверточная нейросеть (требует tensorflow)
+  cnn          — 7 CNN/RNN архитектур: TextCNN, StackedCNN, DPCNN,
+                  CNN-BiLSTM, BiLSTM, BiGRU, BiLSTM+Attention (требует tensorflow)
   llm          — zero-shot + few-shot через OpenAI-совместимый API
   all          — все группы
 
