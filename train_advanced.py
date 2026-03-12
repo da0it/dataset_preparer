@@ -1279,7 +1279,7 @@ def run_cnn_models(
     epochs=10,
     max_words=5000,
     max_length=200,
-    use_pretrained=False,
+    pretrained_emb="none",
 ):
     """
     3.3.4  CNN / RNN — сравнительное обучение 7 архитектур (PyTorch).
@@ -1292,6 +1292,10 @@ def run_cnn_models(
       BiLSTM           — двунаправленный LSTM
       BiGRU            — двунаправленный GRU
       BiLSTM+Attention — BiLSTM + мягкое внимание
+
+    pretrained_emb: "none" | "word2vec" | "fasttext" | "both"
+      При "word2vec"/"fasttext"/"both" каждая архитектура запускается
+      дополнительно с предобученными эмбеддингами (+W2V / +FT).
     """
     print(f"\n{'═' * 60}")
     print("  3.3.4  CNN / RNN (PyTorch)")
@@ -1333,6 +1337,46 @@ def run_cnn_models(
     X_tr = _encode(X_train)
     X_te = _encode(X_test)
 
+    # ── Предобученные эмбеддинги (Word2Vec / FastText через gensim) ──────────
+    emb_weights: dict[str, "torch.FloatTensor"] = {}
+    if pretrained_emb in ("word2vec", "fasttext", "both"):
+        try:
+            import torch as _torch
+            sentences = [_tok(t) for t in X_train]
+
+            if pretrained_emb in ("word2vec", "both"):
+                from gensim.models import Word2Vec as _W2V
+                print(f"\n  Обучение Word2Vec (dim={embedding_dim})...", end=" ", flush=True)
+                w2v = _W2V(sentences, vector_size=embedding_dim, window=5,
+                           min_count=1, workers=4, epochs=15, sg=1)
+                mat = np.zeros((max_words, embedding_dim), dtype=np.float32)
+                hit = 0
+                for word, idx in vocab.items():
+                    if idx < max_words and word in w2v.wv:
+                        mat[idx] = w2v.wv[word]
+                        hit += 1
+                emb_weights["word2vec"] = _torch.FloatTensor(mat)
+                print(f"покрытие словаря {hit}/{len(vocab)}")
+
+            if pretrained_emb in ("fasttext", "both"):
+                from gensim.models import FastText as _FT
+                print(f"  Обучение FastText (dim={embedding_dim})...", end=" ", flush=True)
+                ft = _FT(sentences, vector_size=embedding_dim, window=5,
+                         min_count=1, workers=4, epochs=15, sg=1)
+                mat = np.zeros((max_words, embedding_dim), dtype=np.float32)
+                hit = 0
+                for word, idx in vocab.items():
+                    if idx < max_words and word in ft.wv:
+                        mat[idx] = ft.wv[word]
+                        hit += 1
+                emb_weights["fasttext"] = _torch.FloatTensor(mat)
+                print(f"покрытие словаря {hit}/{len(vocab)}")
+
+        except ImportError:
+            print("\n  ПРЕДУПРЕЖДЕНИЕ — gensim не установлен, "
+                  "предобученные эмбеддинги пропущены.")
+            print("  Установка: pip install gensim")
+
     # ── Кодирование меток ───────────────────────────────────────────────────
     le = LabelEncoder()
     y_tr = le.fit_transform(y_train).astype(np.int64)
@@ -1347,11 +1391,19 @@ def run_cnn_models(
 
     # ── Определения PyTorch-моделей ─────────────────────────────────────────
 
+    def _make_emb(ew=None):
+        """Создать слой эмбеддинга: из предобученных весов или случайный."""
+        if ew is not None:
+            return nn.Embedding.from_pretrained(
+                ew.clone(), freeze=False, padding_idx=0
+            )
+        return nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+
     class TextCNN(nn.Module):
         """Kim (2014). Параллельные Conv1d с разными размерами ядра."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb   = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb   = _make_emb(emb_weight)
             self.convs = nn.ModuleList([
                 nn.Conv1d(embedding_dim, num_filters, fs, padding=fs // 2)
                 for fs in filter_sizes
@@ -1368,9 +1420,9 @@ def run_cnn_models(
 
     class StackedCNN(nn.Module):
         """Несколько слоёв Conv1d с нарастающей шириной фильтров."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb   = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb   = _make_emb(emb_weight)
             self.conv1 = nn.Conv1d(embedding_dim,     num_filters,     3, padding=1)
             self.conv2 = nn.Conv1d(num_filters,       num_filters,     3, padding=1)
             self.pool  = nn.MaxPool1d(2)
@@ -1389,9 +1441,9 @@ def run_cnn_models(
         """Deep Pyramid CNN (Johnson & Zhang, 2017).
         Residual-блоки + пирамидальный downsampling.
         """
-        def __init__(self, num_blocks=3):
+        def __init__(self, num_blocks=3, emb_weight=None):
             super().__init__()
-            self.emb    = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb    = _make_emb(emb_weight)
             self.region = nn.Conv1d(embedding_dim, num_filters, 3, padding=1)
             self.blocks = nn.ModuleList([
                 nn.ModuleList([
@@ -1415,9 +1467,9 @@ def run_cnn_models(
 
     class CNNBiLSTM(nn.Module):
         """Conv1d для локальных n-граммных паттернов + BiLSTM для контекста."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb  = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb  = _make_emb(emb_weight)
             self.conv = nn.Conv1d(embedding_dim, num_filters, 5, padding=2)
             self.pool = nn.MaxPool1d(2)
             self.lstm = nn.LSTM(num_filters, lstm_units, batch_first=True,
@@ -1433,9 +1485,9 @@ def run_cnn_models(
 
     class BiLSTM(nn.Module):
         """Двунаправленный LSTM — классический RNN-baseline."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb  = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb  = _make_emb(emb_weight)
             self.lstm = nn.LSTM(embedding_dim, lstm_units, batch_first=True,
                                 bidirectional=True)
             self.drop = nn.Dropout(0.5)
@@ -1448,9 +1500,9 @@ def run_cnn_models(
 
     class BiGRU(nn.Module):
         """Двунаправленный GRU — быстрее LSTM, конкурентное качество."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb = _make_emb(emb_weight)
             self.gru = nn.GRU(embedding_dim, lstm_units, batch_first=True,
                               bidirectional=True)
             self.drop = nn.Dropout(0.5)
@@ -1463,9 +1515,9 @@ def run_cnn_models(
 
     class BiLSTMAttention(nn.Module):
         """BiLSTM с мягким вниманием Bahdanau."""
-        def __init__(self):
+        def __init__(self, emb_weight=None):
             super().__init__()
-            self.emb   = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.emb   = _make_emb(emb_weight)
             self.lstm  = nn.LSTM(embedding_dim, lstm_units, batch_first=True,
                                  bidirectional=True)
             self.att_w = nn.Linear(lstm_units * 2, 1)
@@ -1552,7 +1604,8 @@ def run_cnn_models(
         return hist
 
     # ── Список архитектур ───────────────────────────────────────────────────
-    architectures = [
+    # Базовые 7 архитектур (случайные эмбеддинги)
+    _base_archs = [
         (f"TextCNN (emb={embedding_dim}, filters={num_filters}x{filter_sizes})", "cnn", TextCNN),
         (f"StackedCNN (emb={embedding_dim}, filters={num_filters})",             "cnn", StackedCNN),
         (f"DPCNN (emb={embedding_dim}, filters={num_filters})",                  "cnn", DPCNN),
@@ -1562,17 +1615,30 @@ def run_cnn_models(
         (f"BiLSTM+Attention (units={lstm_units})",                               "rnn", BiLSTMAttention),
     ]
 
+    # Для каждого базового варианта добавляем предобученные эмбеддинги
+    _emb_tag_map = {"word2vec": "+W2V", "fasttext": "+FT"}
+    architectures = []
+    for label, group, ModelClass in _base_archs:
+        # Всегда включаем вариант со случайными эмбеддингами
+        architectures.append((label, group, ModelClass, None))
+        # Добавляем варианты с предобученными эмбеддингами (если обучены)
+        for emb_key, emb_tag in _emb_tag_map.items():
+            if emb_key in emb_weights:
+                short_base = label.split(" (")[0]
+                new_label  = f"{short_base}{emb_tag} (emb={embedding_dim})"
+                architectures.append((new_label, group, ModelClass, emb_weights[emb_key]))
+
     # ── Обучение и оценка ───────────────────────────────────────────────────
     all_histories: dict[str, dict] = {}
     X_te_t = torch.from_numpy(X_te).to(device)
 
-    for label, group, ModelClass in architectures:
+    for label, group, ModelClass, emb_w in architectures:
         short = label.split(" (")[0]
         sep   = "─" * max(0, 50 - len(short))
         print(f"\n  ── {short} {sep}")
 
         try:
-            model   = ModelClass()
+            model   = ModelClass(emb_weight=emb_w) if emb_w is not None else ModelClass()
             n_params = sum(p.numel() for p in model.parameters())
             print(f"     Параметров: {n_params:,}")
 
@@ -1588,16 +1654,17 @@ def run_cnn_models(
 
             y_pred = le.inverse_transform(logits.argmax(1).cpu().numpy())
 
+            emb_note = "pretrained" if emb_w is not None else "scratch"
             f1 = store.record(
                 label, group, y_test, y_pred, train_sec, infer_ms,
-                notes=f"epochs_run={len(hist['loss'])}",
+                notes=f"epochs_run={len(hist['loss'])},emb={emb_note}",
             )
             print(f"     F1: {f1:.3f}  |  Train: {train_sec:.1f}s  "
                   f"|  Эпох: {len(hist['loss'])}")
             print(classification_report(y_test, y_pred, zero_division=0))
 
-            all_histories[short] = hist
-            safe_name = re.sub(r"[^\w]+", "_", short).strip("_")
+            all_histories[label] = hist
+            safe_name = re.sub(r"[^\w]+", "_", label).strip("_")
             save_confusion_matrix(y_test, y_pred, label, output_dir)
             torch.save(model.state_dict(), output_dir / f"{safe_name}_model.pt")
 
@@ -1801,6 +1868,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             max_length=args.cnn_max_length,
             epochs=args.cnn_epochs,
             batch_size=args.batch_size,
+            pretrained_emb=args.cnn_pretrained_emb,
         )
 
     # ── 3.4 ──────────────────────────────────────────────────────────────────
@@ -1927,6 +1995,11 @@ def main():
     parser.add_argument("--cnn-epochs", type=int, default=20,
                         help="Число эпох для CNN/RNN (default: 20; "
                              "--epochs задаёт эпохи только для трансформеров)")
+    parser.add_argument("--cnn-pretrained-emb", default="none",
+                        choices=["none", "word2vec", "fasttext", "both"],
+                        help="Предобученные эмбеддинги для CNN/RNN: "
+                             "none (только случайные), word2vec, fasttext, both "
+                             "(default: none)")
 
     args = parser.parse_args()
 
