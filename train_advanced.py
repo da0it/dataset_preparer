@@ -1313,16 +1313,19 @@ def run_cnn_models(
 
     # ── Токенизация (без зависимости от TF/Keras) ───────────────────────────
     from collections import Counter
+    # \b\w+\b корректно отделяет пунктуацию от слов (важно для русского текста)
+    _tok = lambda t: re.findall(r'\w+', str(t).lower())
+
     counter = Counter()
     for text in X_train:
-        counter.update(str(text).lower().split())
+        counter.update(_tok(text))
     # 0 = PAD, 1 = UNK
     vocab = {w: i + 2 for i, (w, _) in enumerate(counter.most_common(max_words - 2))}
 
     def _encode(texts):
         out = []
         for text in texts:
-            ids = [vocab.get(w, 1) for w in str(text).lower().split()][:max_length]
+            ids = [vocab.get(w, 1) for w in _tok(text)][:max_length]
             ids += [0] * (max_length - len(ids))
             out.append(ids)
         return np.array(out, dtype=np.int64)
@@ -1491,15 +1494,15 @@ def run_cnn_models(
         train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_dl   = DataLoader(val_ds,   batch_size=batch_size)
 
-        opt       = torch.optim.Adam(model.parameters())
+        opt       = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, factor=0.5, patience=2
+            opt, factor=0.5, patience=3
         )
         crit = nn.CrossEntropyLoss()
 
-        best_val  = float("inf")
-        pat_cnt   = 0
-        patience  = 3
+        best_val   = float("inf")
+        pat_cnt    = 0
+        patience   = 5
         best_state = None
         hist = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
 
@@ -1512,6 +1515,7 @@ def run_cnn_models(
                 out  = model(xb)
                 loss = crit(out, yb)
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 opt.step()
                 tl += loss.item() * len(yb)
                 tc += (out.argmax(1) == yb).sum().item()
@@ -1916,8 +1920,8 @@ def main():
                         help="Количество фильтров в CNN (default: 100)")
     parser.add_argument("--cnn-filter-sizes", default="3,4,5",
                         help="Размеры фильтров через запятую (default: 3,4,5)")
-    parser.add_argument("--cnn-max-words", type=int, default=5000,
-                        help="Максимальный размер словаря (default: 5000)")
+    parser.add_argument("--cnn-max-words", type=int, default=20000,
+                        help="Максимальный размер словаря (default: 20000)")
     parser.add_argument("--cnn-max-length", type=int, default=200,
                         help="Максимальная длина последовательности (default: 200)")
     parser.add_argument("--cnn-epochs", type=int, default=20,
