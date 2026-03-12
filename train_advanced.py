@@ -1795,7 +1795,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
             filter_sizes=[int(x) for x in args.cnn_filter_sizes.split(",")],
             max_words=args.cnn_max_words,
             max_length=args.cnn_max_length,
-            epochs=args.epochs,
+            epochs=args.cnn_epochs,
             batch_size=args.batch_size,
         )
 
@@ -1919,7 +1919,10 @@ def main():
     parser.add_argument("--cnn-max-words", type=int, default=5000,
                         help="Максимальный размер словаря (default: 5000)")
     parser.add_argument("--cnn-max-length", type=int, default=200,
-                    help="Максимальная длина последовательности (default: 200)")
+                        help="Максимальная длина последовательности (default: 200)")
+    parser.add_argument("--cnn-epochs", type=int, default=20,
+                        help="Число эпох для CNN/RNN (default: 20; "
+                             "--epochs задаёт эпохи только для трансформеров)")
 
     args = parser.parse_args()
 
