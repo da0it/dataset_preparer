@@ -407,11 +407,12 @@ def main():
 
     if args.sbert:
         try:
-            import importlib
-            importlib.import_module("sentence_transformers")
+            from sentence_transformers import SentenceTransformer  # noqa: F401
             print(f"  SBERT enabled: {args.sbert_model}")
         except Exception as e:
-            print(f"  WARNING: sentence-transformers unavailable ({type(e).__name__}: {e}). Skipping SBERT.")
+            msg = str(e)
+            hint = " (try: pip uninstall codecarbon -y)" if "CodeCarbon" in msg else ""
+            print(f"  WARNING: sentence-transformers unavailable ({type(e).__name__}: {msg}){hint}. Skipping SBERT.")
             args.sbert = False
 
     run_meta = {
