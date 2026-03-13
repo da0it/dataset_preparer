@@ -407,11 +407,11 @@ def main():
 
     if args.sbert:
         try:
-            import sentence_transformers  # noqa: F401
+            import importlib
+            importlib.import_module("sentence_transformers")
             print(f"  SBERT enabled: {args.sbert_model}")
-        except ImportError:
-            print("  WARNING: sentence-transformers not installed. "
-                  "Run: pip install sentence-transformers\n  Skipping SBERT.")
+        except Exception as e:
+            print(f"  WARNING: sentence-transformers unavailable ({type(e).__name__}: {e}). Skipping SBERT.")
             args.sbert = False
 
     run_meta = {
