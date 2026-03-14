@@ -4,14 +4,13 @@ ensemble.py — Voting ensemble for support call classification.
 
 Base models (all TF-IDF based):
   1. TF-IDF + SVM        (Calibrated LinearSVC → soft probabilities)
-  2. TF-IDF + Keywords + SVM (same, with keyword features)
-  3. TF-IDF + RandomForest
+  2. TF-IDF + RandomForest
+  3. TF-IDF + XGBoost
 
 Optional:
   4. SBERT + SVM         (requires sentence-transformers, enabled via --sbert)
 
 Voting: soft (averaged class probabilities across all base models).
-        Falls back to hard voting if any model lacks predict_proba.
 
 Outputs (per target):
   - Confusion matrices for each base model + ensemble
@@ -27,7 +26,6 @@ Usage:
 
 import argparse
 import json
-import re
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -36,16 +34,16 @@ import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from xgboost import XGBClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
 
 warnings.filterwarnings("ignore")
@@ -54,46 +52,6 @@ TARGETS = ["call_purpose", "priority", "assig_group"]
 SEP = ";"
 MIN_SAMPLES_PER_CLASS = 5
 TEST_SIZE = 0.2
-
-# ── Keyword feature engineering (same as train.py) ───────────────────────────
-
-_COMMERCIAL_KEYWORDS = re.compile(
-    r"\b(?:"
-    r"стоимост[ьи]|цен[ауе]|прайс|лицензи[яию]|лицензирован\w+"
-    r"|купить|приобрести|закупк[аи]|бюджет\w*"
-    r"|коммерческ\w+|предложени[яе]|прайс.?лист"
-    r"|менеджер\w*\s+(?:по\s+)?продаж\w+"
-    r"|отдел\s+продаж|тендер\w*|договор\w*"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_TECHNICAL_KEYWORDS = re.compile(
-    r"\b(?:"
-    r"установ\w+|настро\w+|развернуть|деплой\w*|конфигур\w+"
-    r"|ошибк[аи]|баг\w*|верси[яию]|кластер\w*|нод[аы]"
-    r"|питон|python|ansible|docker|linux|bash|shell"
-    r"|adcm|adh|adpg|adb|арендата\s+дб"
-    r"|не\s+работает|не\s+запускается|не\s+подключается|упал\w*"
-    r"|логи|дебаг\w*|трейс\w*|стектрейс\w*"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-class KeywordFeaturesTransformer(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        has_commercial = np.array(
-            [1.0 if _COMMERCIAL_KEYWORDS.search(t) else 0.0 for t in X]
-        ).reshape(-1, 1)
-        has_technical = np.array(
-            [1.0 if _TECHNICAL_KEYWORDS.search(t) else 0.0 for t in X]
-        ).reshape(-1, 1)
-        return np.hstack([has_commercial, has_technical])
-
 
 # ── Optional: SBERT transformer ───────────────────────────────────────────────
 
@@ -156,25 +114,24 @@ def build_svm_pipeline() -> Pipeline:
     ])
 
 
-def build_svm_keywords_pipeline() -> Pipeline:
-    """TF-IDF + Keyword features + Calibrated SVM."""
-    return Pipeline([
-        ("features", FeatureUnion([
-            ("tfidf",    TfidfVectorizer(**_tfidf_params())),
-            ("keywords", KeywordFeaturesTransformer()),
-        ])),
-        ("clf", CalibratedClassifierCV(
-            LinearSVC(C=1.0, max_iter=3000, class_weight="balanced"), cv=3
-        )),
-    ])
-
-
 def build_rf_pipeline() -> Pipeline:
     """TF-IDF + Random Forest (has predict_proba natively)."""
     return Pipeline([
         ("tfidf", TfidfVectorizer(**_tfidf_params())),
         ("clf",   RandomForestClassifier(
             n_estimators=200, class_weight="balanced",
+            random_state=42, n_jobs=-1,
+        )),
+    ])
+
+
+def build_xgb_pipeline() -> Pipeline:
+    """TF-IDF + XGBoost (has predict_proba natively)."""
+    return Pipeline([
+        ("tfidf", TfidfVectorizer(**_tfidf_params())),
+        ("clf",   XGBClassifier(
+            n_estimators=200, learning_rate=0.1, max_depth=6,
+            use_label_encoder=False, eval_metric="mlogloss",
             random_state=42, n_jobs=-1,
         )),
     ])
@@ -195,11 +152,11 @@ def build_sbert_pipeline(model_name: str) -> Pipeline:
 def build_ensemble(use_sbert: bool, sbert_model: str) -> tuple[VotingClassifier, list[str]]:
     """Build VotingClassifier from base models. Returns (ensemble, base_model_names)."""
     estimators = [
-        ("svm",      build_svm_pipeline()),
-        ("svm_kw",   build_svm_keywords_pipeline()),
-        ("rf",       build_rf_pipeline()),
+        ("svm", build_svm_pipeline()),
+        ("rf",  build_rf_pipeline()),
+        ("xgb", build_xgb_pipeline()),
     ]
-    names = ["TF-IDF + SVM", "TF-IDF + Keywords + SVM", "TF-IDF + RF"]
+    names = ["TF-IDF + SVM", "TF-IDF + RF", "TF-IDF + XGBoost"]
 
     if use_sbert:
         estimators.append(("sbert", build_sbert_pipeline(sbert_model)))
