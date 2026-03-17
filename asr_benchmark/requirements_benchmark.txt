@@ -1,0 +1,19 @@
+# ASR Benchmark — дополнительные зависимости
+# Основные (whisperx, torch, transformers) уже есть в ../requirements.txt
+
+# Метрики
+jiwer>=3.0
+
+# ASR-движки
+faster-whisper>=1.0
+vosk
+
+# Аудио
+pydub       # конвертация mp3 → wav (требует ffmpeg: brew install ffmpeg)
+librosa     # загрузка аудио для wav2vec2
+soundfile   # backend для librosa
+
+# Утилиты
+tqdm
+pandas
+tabulate    # опционально, для красивых таблиц
