@@ -1,19 +1,33 @@
-# ASR Benchmark — дополнительные зависимости
+# ASR + Diarization Benchmark — зависимости
 # Основные (whisperx, torch, transformers) уже есть в ../requirements.txt
 
-# Метрики
+# ── ASR Метрики ────────────────────────────────────────────────
 jiwer>=3.0
 
-# ASR-движки
+# ── ASR-движки ─────────────────────────────────────────────────
 faster-whisper>=1.0
 vosk
 
-# Аудио
+# ── Диаризация ─────────────────────────────────────────────────
+# pyannote (нужен HF токен + принять лицензию на hf.co/pyannote/speaker-diarization-3.1)
+pyannote.audio>=3.1
+pyannote.metrics>=3.2
+
+# NeMo (тяжёлая зависимость, ~2GB; раскомментируй если нужно)
+# nemo_toolkit[asr]
+
+# SpeechBrain
+speechbrain>=1.0
+
+# Кластеризация для SpeechBrain-диаризации
+scikit-learn>=1.3
+
+# ── Аудио ──────────────────────────────────────────────────────
 pydub       # конвертация mp3 → wav (требует ffmpeg: brew install ffmpeg)
-librosa     # загрузка аудио для wav2vec2
+librosa     # загрузка аудио для wav2vec2 и speechbrain
 soundfile   # backend для librosa
 
-# Утилиты
+# ── Утилиты ────────────────────────────────────────────────────
 tqdm
 pandas
 tabulate    # опционально, для красивых таблиц
