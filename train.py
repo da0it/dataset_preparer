@@ -31,6 +31,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from dataset_variants import (
+    load_training_frame,
+    prepare_binary_spam_frame,
+    prepare_multiclass_frame,
+    save_prepared_dataset,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import (
@@ -110,34 +116,14 @@ class KeywordFeaturesTransformer(BaseEstimator, TransformerMixin):
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def load_data(csv_path: Path, target: str) -> tuple[pd.Series, pd.Series]:
-    """Load CSV, keep only training samples, drop empty/rare classes."""
-    df = pd.read_csv(csv_path, sep=SEP, dtype=str).fillna("")
-
-    # Keep only rows explicitly marked for training
-    if "is_training_sample" in df.columns:
-        df = df[df["is_training_sample"].str.strip() == "1"]
-
-    # Drop rows with empty text or empty target
-    df = df[df["text"].str.strip() != ""]
-    df = df[df[target].str.strip() != ""]
-
-    # Drop rare classes
-    counts = df[target].value_counts()
-    valid_classes = counts[counts >= MIN_SAMPLES_PER_CLASS].index
-    dropped = counts[counts < MIN_SAMPLES_PER_CLASS]
-    if len(dropped) > 0:
-        print(f"  Dropping {len(dropped)} rare class(es) "
-              f"(< {MIN_SAMPLES_PER_CLASS} samples): {dropped.index.tolist()}")
-    df = df[df[target].isin(valid_classes)]
-
-    if len(df) == 0:
-        raise ValueError(
-            f"No usable samples for target '{target}'. "
-            f"Make sure is_training_sample=1 and '{target}' is filled."
+def prepare_dataset(df: pd.DataFrame, target: str, dataset_variant: str) -> pd.DataFrame:
+    if dataset_variant == "binary_spam":
+        return prepare_binary_spam_frame(
+            df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
         )
-
-    return df["text"], df[target]
+    return prepare_multiclass_frame(
+        df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+    )
 
 
 # ── Model definitions ─────────────────────────────────────────────────────────
@@ -345,22 +331,28 @@ def _print_class_distribution(y: pd.Series):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_target(csv_path: Path, target: str, output_dir: Path,
-               run_meta: dict) -> list[dict]:
+def run_target(df: pd.DataFrame, target: str, output_dir: Path,
+               run_meta: dict, dataset_variant: str) -> list[dict]:
     """Обучает все модели для одного таргета. Возвращает список результатов."""
     print(f"\n{'═' * 60}")
-    print(f"  TARGET: {target}")
+    print(f"  TARGET: {target}  |  variant: {dataset_variant}")
     print(f"{'═' * 60}")
 
     target_dir = output_dir / target
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        X, y = load_data(csv_path, target)
+        prepared_df = prepare_dataset(df, target, dataset_variant)
     except ValueError as e:
         print(f"  Skipping: {e}")
         return []
 
+    snapshot_path = target_dir / "dataset_prepared.csv"
+    save_prepared_dataset(prepared_df, snapshot_path, sep=SEP)
+    print(f"  Prepared dataset: {snapshot_path}")
+
+    X = prepared_df["text"]
+    y = prepared_df[target]
     class_dist = y.value_counts().to_dict()
     print(f"  Всего samples : {len(X)}")
     _print_class_distribution(y)
@@ -378,6 +370,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path,
         try:
             result = evaluate(name, pipeline, X_train, y_train, X_test, y_test, target_dir)
             result["target"]        = target
+            result["dataset_variant"] = dataset_variant
             result["n_total"]       = len(X)
             result["n_train"]       = len(X_train)
             result["n_test"]        = len(X_test)
@@ -399,12 +392,14 @@ def run_target(csv_path: Path, target: str, output_dir: Path,
         target_log = {
             "run": run_meta,
             "target": target,
+            "dataset_variant": dataset_variant,
             "data": {
                 "n_total":    len(X),
                 "n_train":    len(X_train),
                 "n_test":     len(X_test),
                 "test_size":  TEST_SIZE,
                 "class_dist": {str(k): int(v) for k, v in class_dist.items()},
+                "prepared_dataset": str(snapshot_path),
             },
             "models": results,
         }
@@ -429,19 +424,40 @@ def main():
                         help="Output directory for models and plots (default: ./models)")
     parser.add_argument("--sep", default=";",
                         help="CSV separator (default: ;)")
+    parser.add_argument("--binary-input", default=None,
+                        help="Optional second CSV for binary spam/non-spam training. "
+                             "All non-spam call_purpose labels collapse to 'non_spam'.")
 
     args = parser.parse_args()
 
     global SEP
     SEP = args.sep
 
-    csv_path   = Path(args.input).resolve()
+    csv_path = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not csv_path.exists():
         print(f"Error: file '{csv_path}' not found.")
         return
+
+    try:
+        multiclass_df = load_training_frame(csv_path, sep=SEP)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
+    binary_path = Path(args.binary_input).resolve() if args.binary_input else None
+    binary_df = None
+    if binary_path is not None:
+        if not binary_path.exists():
+            print(f"Error: binary file '{binary_path}' not found.")
+            return
+        try:
+            binary_df = load_training_frame(binary_path, sep=SEP)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return
 
     # Метаинформация о запуске — пишется в каждый лог
     run_meta = {
@@ -455,8 +471,29 @@ def main():
 
     targets = TARGETS if args.target == "all" else [args.target]
     all_results = []
+    multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
     for target in targets:
-        results = run_target(csv_path, target, output_dir, run_meta)
+        results = run_target(
+            multiclass_df,
+            target,
+            multiclass_output_dir,
+            {**run_meta, "dataset_variant": "multiclass"},
+            "multiclass",
+        )
+        all_results.extend(results)
+
+    if binary_df is not None and "call_purpose" in targets:
+        results = run_target(
+            binary_df,
+            "call_purpose",
+            output_dir / "binary_spam",
+            {
+                **run_meta,
+                "input_file": str(binary_path),
+                "dataset_variant": "binary_spam",
+            },
+            "binary_spam",
+        )
         all_results.extend(results)
 
     # Сводный лог всего запуска
@@ -465,6 +502,7 @@ def main():
             "run": run_meta,
             "summary": [
                 {
+                    "dataset_variant": r.get("dataset_variant", "multiclass"),
                     "target":       r["target"],
                     "model":        r["model"],
                     "cv_f1_mean":   r["cv_f1_mean"],

@@ -67,6 +67,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from dataset_variants import (
+    load_training_frame,
+    prepare_binary_spam_frame,
+    prepare_multiclass_frame,
+    save_prepared_dataset,
+)
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
@@ -141,27 +147,14 @@ def print_gpu_info() -> None:
 # DATA LOADING
 # ==============================================================================
 
-def load_data(csv_path: Path, target: str, sep: str = ";"):
-    """Load CSV, keep only training samples, drop empty/rare classes."""
-    df = pd.read_csv(csv_path, sep=sep, dtype=str).fillna("")
-
-    if "is_training_sample" in df.columns:
-        df = df[df["is_training_sample"].str.strip() == "1"]
-
-    df = df[df["text"].str.strip() != ""]
-    df = df[df[target].str.strip() != ""]
-
-    counts = df[target].value_counts()
-    valid = counts[counts >= MIN_SAMPLES_PER_CLASS].index
-    dropped = counts[counts < MIN_SAMPLES_PER_CLASS]
-    if len(dropped):
-        print(f"  Dropping {len(dropped)} rare class(es): {dropped.index.tolist()}")
-    df = df[df[target].isin(valid)]
-
-    if len(df) == 0:
-        raise ValueError(f"No usable samples for target='{target}'.")
-
-    return df["text"].reset_index(drop=True), df[target].reset_index(drop=True)
+def prepare_dataset(df: pd.DataFrame, target: str, dataset_variant: str) -> pd.DataFrame:
+    if dataset_variant == "binary_spam":
+        return prepare_binary_spam_frame(
+            df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+        )
+    return prepare_multiclass_frame(
+        df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+    )
 
 
 # ==============================================================================
@@ -1133,21 +1126,27 @@ _TARGET_DESCRIPTIONS = {
 }
 
 
-def run_target(csv_path: Path, target: str, output_dir: Path, args) -> None:
+def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_variant: str) -> None:
     """Запускает все запрошенные группы моделей для одного таргета."""
     print(f"\n{'━' * 60}")
-    print(f"  ТАРГЕТ: {target}")
+    print(f"  ТАРГЕТ: {target}  |  variant: {dataset_variant}")
     print(f"{'━' * 60}")
 
     target_dir = output_dir / target
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        X, y = load_data(csv_path, target, sep=args.sep)
+        prepared_df = prepare_dataset(df, target, dataset_variant)
     except ValueError as e:
         print(f"  Пропуск: {e}")
         return
 
+    snapshot_path = target_dir / "dataset_prepared.csv"
+    save_prepared_dataset(prepared_df, snapshot_path, sep=args.sep)
+    print(f"  Prepared dataset: {snapshot_path}")
+
+    X = prepared_df["text"].reset_index(drop=True)
+    y = prepared_df[target].reset_index(drop=True)
     print(f"  Всего: {len(X)} примеров, {y.nunique()} классов")
     for cls, cnt in y.value_counts().items():
         print(f"    {cls:<35} {cnt:>4}  {'█' * min(cnt, 40)}")
@@ -1247,6 +1246,9 @@ def main():
                         help="Папка для моделей и отчётов (default: models_advanced)")
     parser.add_argument("--sep", default=";",
                         help="Разделитель CSV (default: ;)")
+    parser.add_argument("--binary-input", default=None,
+                        help="Опциональный второй CSV для spam/non-spam. "
+                             "Все call_purpose != spam будут схлопнуты в non_spam.")
 
     # ── Эмбеддинги ────────────────────────────────────────────────────────────
     parser.add_argument("--sbert-model",
@@ -1304,7 +1306,7 @@ def main():
 
     print_gpu_info()
 
-    csv_path   = Path(args.input).resolve()
+    csv_path = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1312,9 +1314,31 @@ def main():
         print(f"Ошибка: файл '{csv_path}' не найден.")
         sys.exit(1)
 
+    try:
+        multiclass_df = load_training_frame(csv_path, sep=args.sep)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        sys.exit(1)
+
+    binary_path = Path(args.binary_input).resolve() if args.binary_input else None
+    binary_df = None
+    if binary_path is not None:
+        if not binary_path.exists():
+            print(f"Ошибка: файл '{binary_path}' не найден.")
+            sys.exit(1)
+        try:
+            binary_df = load_training_frame(binary_path, sep=args.sep)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+
     targets = TARGETS if args.target == "all" else [args.target]
+    multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
     for target in targets:
-        run_target(csv_path, target, output_dir, args)
+        run_target(multiclass_df, target, multiclass_output_dir, args, "multiclass")
+
+    if binary_df is not None and "call_purpose" in targets:
+        run_target(binary_df, "call_purpose", output_dir / "binary_spam", args, "binary_spam")
 
     print(f"\n{'━' * 60}")
     print(f"  Готово. Результаты: {output_dir}")

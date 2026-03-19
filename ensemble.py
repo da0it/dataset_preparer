@@ -36,6 +36,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from dataset_variants import (
+    load_training_frame,
+    prepare_binary_spam_frame,
+    prepare_multiclass_frame,
+    save_prepared_dataset,
+)
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
@@ -77,24 +83,14 @@ class SBERTTransformer(BaseEstimator, TransformerMixin):
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_data(csv_path: Path, target: str) -> tuple[pd.Series, pd.Series]:
-    df = pd.read_csv(csv_path, sep=SEP, dtype=str).fillna("")
-    if "is_training_sample" in df.columns:
-        df = df[df["is_training_sample"].str.strip() == "1"]
-    df = df[df["text"].str.strip() != ""]
-    df = df[df[target].str.strip() != ""]
-
-    counts = df[target].value_counts()
-    valid = counts[counts >= MIN_SAMPLES_PER_CLASS].index
-    dropped = counts[counts < MIN_SAMPLES_PER_CLASS]
-    if len(dropped):
-        print(f"  Dropping {len(dropped)} rare class(es): {dropped.index.tolist()}")
-    df = df[df[target].isin(valid)]
-
-    if len(df) == 0:
-        raise ValueError(f"No usable samples for target '{target}'.")
-
-    return df["text"], df[target]
+def prepare_dataset(df: pd.DataFrame, target: str, dataset_variant: str) -> pd.DataFrame:
+    if dataset_variant == "binary_spam":
+        return prepare_binary_spam_frame(
+            df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+        )
+    return prepare_multiclass_frame(
+        df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+    )
 
 
 # ── Base model builders ───────────────────────────────────────────────────────
@@ -217,22 +213,29 @@ def eval_single(name: str, model: Pipeline,
 
 # ── Main per-target routine ───────────────────────────────────────────────────
 
-def run_target(csv_path: Path, target: str, output_dir: Path,
-               use_sbert: bool, sbert_model: str, run_meta: dict) -> list[dict]:
+def run_target(df: pd.DataFrame, target: str, output_dir: Path,
+               use_sbert: bool, sbert_model: str, run_meta: dict,
+               dataset_variant: str) -> list[dict]:
 
     print(f"\n{'═' * 60}")
-    print(f"  TARGET: {target}")
+    print(f"  TARGET: {target}  |  variant: {dataset_variant}")
     print(f"{'═' * 60}")
 
     target_dir = output_dir / target
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        X, y = load_data(csv_path, target)
+        prepared_df = prepare_dataset(df, target, dataset_variant)
     except ValueError as e:
         print(f"  Skipping: {e}")
         return []
 
+    snapshot_path = target_dir / "dataset_prepared.csv"
+    save_prepared_dataset(prepared_df, snapshot_path, sep=SEP)
+    print(f"  Prepared dataset: {snapshot_path}")
+
+    X = prepared_df["text"]
+    y = prepared_df[target]
     class_dist = y.value_counts().to_dict()
     print(f"  Samples: {len(X)}  |  Classes: {y.nunique()}")
 
@@ -312,12 +315,14 @@ def run_target(csv_path: Path, target: str, output_dir: Path,
     log = {
         "run":    run_meta,
         "target": target,
+        "dataset_variant": dataset_variant,
         "data": {
             "n_total":   len(X),
             "n_train":   len(X_train),
             "n_test":    len(X_test),
             "test_size": TEST_SIZE,
             "class_dist": {str(k): int(v) for k, v in class_dist.items()},
+            "prepared_dataset": str(snapshot_path),
         },
         "models": results,
     }
@@ -326,7 +331,7 @@ def run_target(csv_path: Path, target: str, output_dir: Path,
         json.dump(log, f, ensure_ascii=False, indent=2)
     print(f"\n  Log saved to: {log_path}")
 
-    return [dict(target=target, **r) for r in results]
+    return [dict(target=target, dataset_variant=dataset_variant, **r) for r in results]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -344,6 +349,9 @@ def main():
                         help="Output directory (default: ./models_ensemble)")
     parser.add_argument("--sep", default=";",
                         help="CSV separator (default: ;)")
+    parser.add_argument("--binary-input", default=None,
+                        help="Optional second CSV for spam/non-spam evaluation. "
+                             "All non-spam call_purpose labels collapse to 'non_spam'.")
     parser.add_argument("--sbert", action="store_true",
                         help="Add SBERT + SVM as a 4th base model (requires sentence-transformers)")
     parser.add_argument("--sbert-model",
@@ -354,13 +362,31 @@ def main():
     global SEP
     SEP = args.sep
 
-    csv_path   = Path(args.input).resolve()
+    csv_path = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not csv_path.exists():
         print(f"Error: '{csv_path}' not found.")
         return
+
+    try:
+        multiclass_df = load_training_frame(csv_path, sep=SEP)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
+    binary_path = Path(args.binary_input).resolve() if args.binary_input else None
+    binary_df = None
+    if binary_path is not None:
+        if not binary_path.exists():
+            print(f"Error: '{binary_path}' not found.")
+            return
+        try:
+            binary_df = load_training_frame(binary_path, sep=SEP)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return
 
     if args.sbert:
         try:
@@ -384,9 +410,23 @@ def main():
 
     targets = TARGETS if args.target == "all" else [args.target]
     all_results = []
+    multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
     for target in targets:
-        results = run_target(csv_path, target, output_dir,
-                             args.sbert, args.sbert_model, run_meta)
+        results = run_target(multiclass_df, target, multiclass_output_dir,
+                             args.sbert, args.sbert_model,
+                             {**run_meta, "dataset_variant": "multiclass"},
+                             "multiclass")
+        all_results.extend(results)
+
+    if binary_df is not None and "call_purpose" in targets:
+        results = run_target(binary_df, "call_purpose", output_dir / "binary_spam",
+                             args.sbert, args.sbert_model,
+                             {
+                                 **run_meta,
+                                 "input_file": str(binary_path),
+                                 "dataset_variant": "binary_spam",
+                             },
+                             "binary_spam")
         all_results.extend(results)
 
     if all_results:
