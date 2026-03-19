@@ -298,6 +298,36 @@ def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
     print(f"  График сравнения: {path.name}")
 
 
+def _safe_artifact_name(name: str) -> str:
+    return (
+        name.replace(" ", "_")
+        .replace("/", "-")
+        .replace("+", "plus")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
+def save_epoch_history(
+    history: list[dict],
+    output_dir: Path,
+    model_name: str,
+    meta: dict,
+) -> tuple[Path, Path]:
+    """Save per-epoch training history as JSON and CSV."""
+    hist_dir = output_dir / "_epoch_metrics"
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_artifact_name(model_name)
+    json_path = hist_dir / f"{safe_name}.json"
+    csv_path = hist_dir / f"{safe_name}.csv"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "history": history}, f, ensure_ascii=False, indent=2)
+
+    pd.DataFrame(history).to_csv(csv_path, index=False, encoding="utf-8")
+    return json_path, csv_path
+
+
 # ==============================================================================
 # SECTION 3.2 — БАЗОВЫЕ АЛГОРИТМЫ КЛАССИФИКАЦИИ
 # ==============================================================================
@@ -841,7 +871,9 @@ def _finetune_transformer(
     best_model_state = None
     best_f1 = -1.0
     best_loss = float("inf")
+    best_epoch = 0
     patience_counter = 0
+    epoch_history = []
     if early_stopping > 0:
         print(f"    Early stopping: patience={early_stopping} эпох "
               f"| metric={early_stopping_metric}")
@@ -910,14 +942,27 @@ def _finetune_transformer(
         else:
             improved = epoch_f1 > best_f1
 
+        epoch_history.append({
+            "epoch": epoch + 1,
+            "train_loss": round(float(avg_loss), 6),
+            "val_loss": round(float(epoch_val_loss), 6),
+            "val_f1_weighted": round(float(epoch_f1), 6),
+            "lr": round(float(optimizer.param_groups[0]["lr"]), 12),
+            "improved": bool(improved),
+            "patience_counter": int(patience_counter),
+            "early_stopping_metric": early_stopping_metric,
+        })
+
         if improved:
             best_f1 = epoch_f1
             best_loss = epoch_val_loss
+            best_epoch = epoch + 1
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             if early_stopping > 0:
                 patience_counter += 1
+                epoch_history[-1]["patience_counter"] = int(patience_counter)
                 if patience_counter >= early_stopping:
                     if early_stopping_metric == "loss":
                         best_metric_msg = f"лучший val_loss={best_loss:.4f}"
@@ -955,15 +1000,43 @@ def _finetune_transformer(
         train_sec, infer_ms, notes=model_name,
     ) if not silent else f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
 
+    history_meta = {
+        "model_name": model_name,
+        "friendly_name": friendly_name,
+        "n_train": len(X_train),
+        "n_val": len(X_test),
+        "epochs_requested": epochs,
+        "epochs_completed": len(epoch_history),
+        "best_epoch": best_epoch,
+        "best_val_f1": round(float(best_f1), 6),
+        "best_val_loss": round(float(best_loss), 6),
+        "early_stopping": early_stopping,
+        "early_stopping_metric": early_stopping_metric,
+        "batch_size": batch_size,
+        "grad_accum": grad_accum,
+        "effective_batch_size": batch_size * grad_accum,
+        "max_length": max_length,
+        "learning_rate": lr,
+        "fp16": fp16,
+        "bf16": bf16,
+        "freeze_layers": freeze_layers,
+        "label_smoothing": label_smoothing,
+        "train_sec": round(float(train_sec), 3),
+        "final_test_f1": round(float(f1), 6),
+    }
+    hist_json_path, hist_csv_path = save_epoch_history(
+        epoch_history, output_dir, friendly_name, history_meta
+    )
+
     if not silent:
         print(f"    F1: {f1:.3f}  |  Train: {train_sec:.1f}s")
         print(classification_report(y_test_orig, y_pred, zero_division=0))
         save_confusion_matrix(y_test_orig, y_pred, friendly_name, output_dir)
+        print(f"    Epoch metrics: {hist_csv_path.name}, {hist_json_path.name}")
 
     # ── Save model ────────────────────────────────────────────────────────────
     if save_model and not silent:
-        safe = (friendly_name.replace(" ", "_").replace("/", "-")
-                .replace("(", "").replace(")", ""))
+        safe = _safe_artifact_name(friendly_name)
         model_out = output_dir / safe
         model_out.mkdir(exist_ok=True)
         model.save_pretrained(str(model_out))
