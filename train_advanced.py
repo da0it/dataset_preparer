@@ -675,6 +675,7 @@ def _finetune_transformer(
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
+    early_stopping_metric: str = "f1",
     save_model: bool = True,
     silent: bool = False,
 ):
@@ -839,9 +840,11 @@ def _finetune_transformer(
     t0 = time.perf_counter()
     best_model_state = None
     best_f1 = -1.0
+    best_loss = float("inf")
     patience_counter = 0
     if early_stopping > 0:
-        print(f"    Early stopping: patience={early_stopping} эпох")
+        print(f"    Early stopping: patience={early_stopping} эпох "
+              f"| metric={early_stopping_metric}")
 
     for epoch in range(epochs):
         model.train()
@@ -887,24 +890,41 @@ def _finetune_transformer(
         # Quick val on test to track best epoch
         model.eval()
         preds_epoch = []
+        val_loss_total = 0.0
+        val_batches = 0
         with torch.no_grad():
-            for enc, _ in test_loader:
+            for enc, labels in test_loader:
                 enc = {k: v.to(device) for k, v in enc.items()}
+                labels = labels.to(device)
                 out = model(**enc)
+                val_loss_total += loss_fn(out.logits, labels).item()
+                val_batches += 1
                 preds_epoch.extend(torch.argmax(out.logits, 1).cpu().tolist())
+        epoch_val_loss = val_loss_total / max(val_batches, 1)
         epoch_f1 = f1_score(y_te, preds_epoch, average="weighted", zero_division=0)
-        print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  val_F1={epoch_f1:.3f}")
+        print(f"    Epoch {epoch + 1}: loss={avg_loss:.4f}  "
+              f"val_loss={epoch_val_loss:.4f}  val_F1={epoch_f1:.3f}")
 
-        if epoch_f1 > best_f1:
+        if early_stopping_metric == "loss":
+            improved = epoch_val_loss < best_loss
+        else:
+            improved = epoch_f1 > best_f1
+
+        if improved:
             best_f1 = epoch_f1
+            best_loss = epoch_val_loss
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             if early_stopping > 0:
                 patience_counter += 1
                 if patience_counter >= early_stopping:
+                    if early_stopping_metric == "loss":
+                        best_metric_msg = f"лучший val_loss={best_loss:.4f}"
+                    else:
+                        best_metric_msg = f"лучший val_F1={best_f1:.3f}"
                     print(f"    Early stopping: нет улучшения {early_stopping} эпох подряд, "
-                          f"лучший val_F1={best_f1:.3f} (epoch {epoch + 1 - early_stopping})")
+                          f"{best_metric_msg} (epoch {epoch + 1 - early_stopping})")
                     break
 
     train_sec = time.perf_counter() - t0
@@ -970,6 +990,7 @@ def run_transformer_models(
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
     early_stopping: int = 0,
+    early_stopping_metric: str = "f1",
     extra_models: list = None,
     max_length: int = 256,
     cv: int = 0,
@@ -1010,7 +1031,9 @@ def run_transformer_models(
         fp16=fp16, bf16=bf16, grad_accum=grad_accum,
         compile_model=compile_model, lr=lr,
         freeze_layers=freeze_layers, label_smoothing=label_smoothing,
-        early_stopping=early_stopping, max_length=max_length,
+        early_stopping=early_stopping,
+        early_stopping_metric=early_stopping_metric,
+        max_length=max_length,
     )
 
     for model_id, name in models:
@@ -1192,6 +1215,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             freeze_layers=args.freeze_layers,
             label_smoothing=args.label_smoothing,
             early_stopping=args.early_stopping,
+            early_stopping_metric=args.early_stopping_metric,
             extra_models=args.extra_models,
             max_length=args.max_length,
             cv=args.cv,
@@ -1285,6 +1309,9 @@ def main():
                              "Рекомендуется 0.1 для малых датасетов")
     parser.add_argument("--early-stopping", type=int, default=0,
                         help="Остановить если нет улучшения N эпох подряд (default: 0 = выкл)")
+    parser.add_argument("--early-stopping-metric", choices=["f1", "loss"], default="f1",
+                        help="Метрика для early stopping у трансформеров "
+                             "(default: f1)")
     parser.add_argument("--max-length", type=int, default=256,
                         help="Макс. длина последовательности для трансформеров (default: 256, "
                              "макс: 512). Увеличение до 512 захватывает больше контекста, "
