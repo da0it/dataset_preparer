@@ -349,6 +349,9 @@ def main():
                         help="Output directory (default: ./models_ensemble)")
     parser.add_argument("--sep", default=";",
                         help="CSV separator (default: ;)")
+    parser.add_argument("--dataset-variant", choices=["multiclass", "binary_spam"],
+                        default="multiclass",
+                        help="How to interpret the main --input (default: multiclass)")
     parser.add_argument("--binary-input", default=None,
                         help="Optional second CSV for spam/non-spam evaluation. "
                              "All non-spam call_purpose labels collapse to 'non_spam'.")
@@ -368,6 +371,14 @@ def main():
 
     if not csv_path.exists():
         print(f"Error: '{csv_path}' not found.")
+        return
+
+    if args.dataset_variant == "binary_spam" and args.target not in ("call_purpose", "all"):
+        print("Error: --dataset-variant binary_spam supports only target=call_purpose.")
+        return
+
+    if args.dataset_variant == "binary_spam" and args.binary_input:
+        print("Error: do not use --binary-input together with --dataset-variant binary_spam.")
         return
 
     try:
@@ -410,24 +421,31 @@ def main():
 
     targets = TARGETS if args.target == "all" else [args.target]
     all_results = []
-    multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
-    for target in targets:
-        results = run_target(multiclass_df, target, multiclass_output_dir,
+    if args.dataset_variant == "binary_spam":
+        results = run_target(multiclass_df, "call_purpose", output_dir,
                              args.sbert, args.sbert_model,
-                             {**run_meta, "dataset_variant": "multiclass"},
-                             "multiclass")
-        all_results.extend(results)
-
-    if binary_df is not None and "call_purpose" in targets:
-        results = run_target(binary_df, "call_purpose", output_dir / "binary_spam",
-                             args.sbert, args.sbert_model,
-                             {
-                                 **run_meta,
-                                 "input_file": str(binary_path),
-                                 "dataset_variant": "binary_spam",
-                             },
+                             {**run_meta, "dataset_variant": "binary_spam"},
                              "binary_spam")
         all_results.extend(results)
+    else:
+        multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
+        for target in targets:
+            results = run_target(multiclass_df, target, multiclass_output_dir,
+                                 args.sbert, args.sbert_model,
+                                 {**run_meta, "dataset_variant": "multiclass"},
+                                 "multiclass")
+            all_results.extend(results)
+
+        if binary_df is not None and "call_purpose" in targets:
+            results = run_target(binary_df, "call_purpose", output_dir / "binary_spam",
+                                 args.sbert, args.sbert_model,
+                                 {
+                                     **run_meta,
+                                     "input_file": str(binary_path),
+                                     "dataset_variant": "binary_spam",
+                                 },
+                                 "binary_spam")
+            all_results.extend(results)
 
     if all_results:
         summary_path = output_dir / "ensemble_summary.json"

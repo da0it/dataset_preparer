@@ -1343,6 +1343,10 @@ def main():
                         help="Папка для моделей и отчётов (default: models_advanced)")
     parser.add_argument("--sep", default=";",
                         help="Разделитель CSV (default: ;)")
+    parser.add_argument("--dataset-variant", choices=["multiclass", "binary_spam"],
+                        default="multiclass",
+                        help="Как интерпретировать основной --input "
+                             "(default: multiclass)")
     parser.add_argument("--binary-input", default=None,
                         help="Опциональный второй CSV для spam/non-spam. "
                              "Все call_purpose != spam будут схлопнуты в non_spam.")
@@ -1414,6 +1418,14 @@ def main():
         print(f"Ошибка: файл '{csv_path}' не найден.")
         sys.exit(1)
 
+    if args.dataset_variant == "binary_spam" and args.target not in ("call_purpose", "all"):
+        print("Ошибка: --dataset-variant binary_spam поддерживает только target=call_purpose.")
+        sys.exit(1)
+
+    if args.dataset_variant == "binary_spam" and args.binary_input:
+        print("Ошибка: не используйте --binary-input вместе с --dataset-variant binary_spam.")
+        sys.exit(1)
+
     try:
         multiclass_df = load_training_frame(csv_path, sep=args.sep)
     except ValueError as exc:
@@ -1433,12 +1445,16 @@ def main():
             sys.exit(1)
 
     targets = TARGETS if args.target == "all" else [args.target]
-    multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
-    for target in targets:
-        run_target(multiclass_df, target, multiclass_output_dir, args, "multiclass")
 
-    if binary_df is not None and "call_purpose" in targets:
-        run_target(binary_df, "call_purpose", output_dir / "binary_spam", args, "binary_spam")
+    if args.dataset_variant == "binary_spam":
+        run_target(multiclass_df, "call_purpose", output_dir, args, "binary_spam")
+    else:
+        multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
+        for target in targets:
+            run_target(multiclass_df, target, multiclass_output_dir, args, "multiclass")
+
+        if binary_df is not None and "call_purpose" in targets:
+            run_target(binary_df, "call_purpose", output_dir / "binary_spam", args, "binary_spam")
 
     print(f"\n{'━' * 60}")
     print(f"  Готово. Результаты: {output_dir}")
