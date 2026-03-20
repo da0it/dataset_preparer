@@ -74,6 +74,7 @@ from dataset_variants import (
     save_prepared_dataset,
 )
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -337,7 +338,7 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
     3.2.1 Векторизация: BoW, TF-IDF, N-gram TF-IDF.
     3.2.2 Классификаторы: LogReg, SVM, NaiveBayes, RandomForest.
 
-    Итого 10 пайплайнов для всестороннего baseline-сравнения.
+    Итого 12 пайплайнов для всестороннего baseline-сравнения.
     """
     bow_kw    = dict(max_features=15_000, min_df=1)
     tfidf_kw  = dict(ngram_range=(1, 2), max_features=15_000,
@@ -378,6 +379,13 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
             ("vec", TfidfVectorizer(**tfidf_kw)),
             ("clf", LinearSVC(**svm_kw)),
         ]),
+        "TF-IDF + Calibrated SVM": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            ("clf", CalibratedClassifierCV(
+                LinearSVC(**svm_kw),
+                cv=3,
+            )),
+        ]),
         "TF-IDF + NaiveBayes": Pipeline([
             ("vec", TfidfVectorizer(**tfidf_kw)),
             # ComplementNB лучше MNB для несбалансированных данных с TF-IDF
@@ -391,6 +399,13 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
         "N-gram(1-3) + SVM": Pipeline([
             ("vec", TfidfVectorizer(**ngram_kw)),
             ("clf", LinearSVC(**svm_kw)),
+        ]),
+        "N-gram(1-3) + Calibrated SVM": Pipeline([
+            ("vec", TfidfVectorizer(**ngram_kw)),
+            ("clf", CalibratedClassifierCV(
+                LinearSVC(**svm_kw),
+                cv=3,
+            )),
         ]),
         "N-gram(1-3) + LogReg": Pipeline([
             ("vec", TfidfVectorizer(**ngram_kw)),
