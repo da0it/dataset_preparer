@@ -106,12 +106,19 @@ def validate_binary_labels(
 ) -> pd.DataFrame:
     out = df.copy()
     out[label_col] = out[label_col].astype(str).str.strip()
+    empty_mask = out[label_col] == ""
+    if empty_mask.any():
+        out = out.loc[~empty_mask].copy()
     allowed = {positive_label, negative_label}
     bad = sorted(set(out[label_col]) - allowed)
     if bad:
         raise ValueError(
             f"Unexpected labels in '{label_col}': {bad}. "
             f"Expected only {sorted(allowed)}."
+        )
+    if out.empty:
+        raise ValueError(
+            f"No labeled rows left after filtering empty values in '{label_col}'."
         )
     return out
 
@@ -253,6 +260,7 @@ def main() -> int:
         positive_label=args.positive_label,
         negative_label=args.negative_label,
     )
+    n_labeled = len(df)
 
     sweep, best = optimize_threshold(
         df=df,
@@ -284,7 +292,7 @@ def main() -> int:
             for k, v in best.items()
             if k != "threshold"
         },
-        "n_samples": int(len(df)),
+        "n_samples": int(n_labeled),
     }
     best_path.write_text(
         json.dumps(best_payload, ensure_ascii=False, indent=2),
@@ -295,7 +303,7 @@ def main() -> int:
     lines = [
         "Exact threshold search summary",
         f"Input           : {input_path}",
-        f"Samples         : {len(df)}",
+        f"Samples         : {n_labeled}",
         f"Optimize metric : {args.optimize}",
         f"Decision rule   : {args.positive_label} if score "
         f"{'>=' if args.rule == 'greater_equal' else '<='} threshold",
