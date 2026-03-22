@@ -130,13 +130,51 @@ python calibrate.py \
   --sep ","
 ```
 
-## 9. Инференс SVM по реальным звонкам
+## 9. Подбор threshold для spam-gate
+
+Точный подбор decision threshold по размеченному validation / diagnostic CSV.
+
+```bash
+python optimize_threshold.py \
+  -i diagnostics_25_calls_svm.csv \
+  -o threshold_search_svm \
+  --sep "," \
+  --score-col confidence \
+  --label-col manual_label \
+  --positive-label spam \
+  --negative-label non_spam \
+  --rule greater_equal \
+  --optimize accuracy
+```
+
+Результат:
+
+- `threshold_search_svm/threshold_sweep.csv` — все проверенные threshold и метрики
+- `threshold_search_svm/best_threshold.json` — лучший threshold и итоговые метрики
+- `threshold_search_svm/threshold_summary.txt` — короткая текстовая сводка
+
+Для несбалансированного validation-набора обычно полезно также проверить:
+
+```bash
+python optimize_threshold.py \
+  -i diagnostics_25_calls_svm.csv \
+  -o threshold_search_svm_balanced \
+  --sep "," \
+  --score-col confidence \
+  --label-col manual_label \
+  --positive-label spam \
+  --negative-label non_spam \
+  --rule greater_equal \
+  --optimize balanced_accuracy
+```
+
+## 10. Инференс SVM по реальным звонкам
 
 ```bash
 python -c 'import joblib, pandas as pd; model = joblib.load("models_binary/call_purpose/TF-IDF_plus_SVM.joblib"); df = pd.read_csv("real_calls_clean_no_noise.csv", dtype=str).fillna(""); df["pred"] = model.predict(df["text"]); df["score"] = model.decision_function(df["text"]); out = df[["filename","text","pred","score"]]; out.to_csv("real_calls_pred.csv", index=False, encoding="utf-8"); print(out.to_string(index=False))'
 ```
 
-## 10. Инференс ruBERT по реальным звонкам
+## 11. Инференс ruBERT по реальным звонкам
 
 ```bash
 python -c 'import joblib, pandas as pd, torch; from transformers import AutoTokenizer, AutoModelForSequenceClassification; model_dir="models_binary/call_purpose/RuBERT"; df=pd.read_csv("real_calls_clean_no_noise.csv", dtype=str).fillna(""); texts=df["text"].tolist(); le=joblib.load(model_dir + "/label_encoder.joblib"); tokenizer=AutoTokenizer.from_pretrained(model_dir); model=AutoModelForSequenceClassification.from_pretrained(model_dir).to("cuda" if torch.cuda.is_available() else "cpu"); device=next(model.parameters()).device; model.eval(); preds=[]; scores=[]; bs=16; \
@@ -147,7 +185,7 @@ for i in range(0, len(texts), bs): \
 df["pred"]=preds; df["score"]=scores; out=df[["filename","text","pred","score"]]; out.to_csv("real_calls_pred_rubert.csv", index=False, encoding="utf-8"); print(out.to_string(index=False))'
 ```
 
-## 11. Полный practical pipeline для реальных звонков
+## 12. Полный practical pipeline для реальных звонков
 
 ```bash
 python transcribe.py --input /path/to/mp3_dir --output real_calls.csv --device cuda --compute-type float16 && \
