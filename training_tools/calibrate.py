@@ -278,8 +278,14 @@ def load_model_and_tokenizer(model_dir: Path):
     if not le_path.exists():
         raise FileNotFoundError(f"label_encoder.joblib не найден в {model_dir}")
 
+    def _load_tokenizer(model_ref: str):
+        try:
+            return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
+        except TypeError:
+            return AutoTokenizer.from_pretrained(model_ref)
+
     le        = joblib.load(le_path)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    tokenizer = _load_tokenizer(str(model_dir))
     model     = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

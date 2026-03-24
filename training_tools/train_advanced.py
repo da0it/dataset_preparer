@@ -792,6 +792,12 @@ def _finetune_transformer(
         print("    Установка: pip install transformers torch accelerate")
         return
 
+    def _load_tokenizer(model_ref: str):
+        try:
+            return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
+        except TypeError:
+            return AutoTokenizer.from_pretrained(model_ref)
+
     print(f"\n  [{friendly_name}]  модель: {model_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"    Устройство: {device}")
@@ -812,7 +818,7 @@ def _finetune_transformer(
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = _load_tokenizer(model_name)
     except Exception as e:
         print(f"\n  [{friendly_name}]  ПРОПУСК — не удалось загрузить токенизатор: {e}")
         print(f"    Проверьте правильность model id: {model_name}")
