@@ -30,6 +30,13 @@ except ModuleNotFoundError:
     np = None
     pd = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -95,6 +102,23 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="How many best thresholds to print. Default: 10"
     )
+    parser.add_argument(
+        "--review-threshold",
+        type=float,
+        default=None,
+        help="Optional middle threshold for review-zone analysis."
+    )
+    parser.add_argument(
+        "--block-threshold",
+        type=float,
+        default=None,
+        help="Optional high-confidence threshold for block-zone analysis."
+    )
+    parser.add_argument(
+        "--skip-plots",
+        action="store_true",
+        help="Do not render ROC/PR plots."
+    )
     return parser.parse_args()
 
 
@@ -158,6 +182,13 @@ def predict_by_threshold(
 
 def safe_div(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
+
+
+def normalize_scores_for_positive(scores: np.ndarray, rule: str) -> np.ndarray:
+    """
+    For ROC/PR we want larger values => stronger confidence in positive class.
+    """
+    return scores if rule == "greater_equal" else -scores
 
 
 def compute_metrics(
@@ -232,6 +263,127 @@ def optimize_threshold(
     return sweep, best
 
 
+def compute_curve_metrics(
+    scores: np.ndarray,
+    y_true: np.ndarray,
+    positive_label: str,
+    rule: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, float, float]:
+    try:
+        from sklearn.metrics import (
+            average_precision_score,
+            precision_recall_curve,
+            roc_auc_score,
+            roc_curve,
+        )
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Missing dependency: install scikit-learn in the active environment."
+        ) from exc
+
+    y_bin = (y_true == positive_label).astype(int)
+    pos_scores = normalize_scores_for_positive(scores, rule)
+
+    fpr, tpr, roc_thresholds = roc_curve(y_bin, pos_scores)
+    precision, recall, pr_thresholds = precision_recall_curve(y_bin, pos_scores)
+    roc_auc = float(roc_auc_score(y_bin, pos_scores))
+    pr_auc = float(average_precision_score(y_bin, pos_scores))
+
+    roc_df = pd.DataFrame({
+        "fpr": fpr,
+        "tpr": tpr,
+        "threshold_score": np.r_[roc_thresholds],
+    })
+    pr_df = pd.DataFrame({
+        "precision": precision,
+        "recall": recall,
+        "threshold_score": np.r_[pr_thresholds, np.nan],
+    })
+    return roc_df, pr_df, roc_auc, pr_auc
+
+
+def plot_curve(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+    output_path: Path,
+    diagonal: bool = False,
+) -> None:
+    if plt is None:
+        return
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(df[x_col], df[y_col], linewidth=2.0)
+    if diagonal:
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="gray")
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=140)
+    plt.close()
+
+
+def build_zone_policy_table(
+    scores: np.ndarray,
+    y_true: np.ndarray,
+    positive_label: str,
+    negative_label: str,
+    rule: str,
+    review_threshold: float,
+    block_threshold: float,
+) -> pd.DataFrame:
+    if rule == "greater_equal":
+        if block_threshold < review_threshold:
+            raise ValueError(
+                "For greater_equal rule block-threshold must be >= review-threshold."
+            )
+        zone = np.where(
+            scores >= block_threshold,
+            "block",
+            np.where(scores >= review_threshold, "review", "allow"),
+        )
+    else:
+        if block_threshold > review_threshold:
+            raise ValueError(
+                "For less_equal rule block-threshold must be <= review-threshold."
+            )
+        zone = np.where(
+            scores <= block_threshold,
+            "block",
+            np.where(scores <= review_threshold, "review", "allow"),
+        )
+
+    y_true = np.asarray(y_true)
+    rows = []
+    for zone_name in ["block", "review", "allow"]:
+        mask = zone == zone_name
+        count = int(mask.sum())
+        if count == 0:
+            rows.append({
+                "zone": zone_name,
+                "count": 0,
+                "coverage": 0.0,
+                "spam_share": 0.0,
+                "non_spam_share": 0.0,
+            })
+            continue
+        zone_true = y_true[mask]
+        rows.append({
+            "zone": zone_name,
+            "count": count,
+            "coverage": count / len(y_true),
+            "spam_share": float((zone_true == positive_label).mean()),
+            "non_spam_share": float((zone_true == negative_label).mean()),
+        })
+    return pd.DataFrame(rows)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -272,11 +424,25 @@ def main() -> int:
         optimize_metric=args.optimize,
     )
 
+    scores = df[args.score_col].astype(float).to_numpy()
+    y_true = df[args.label_col].astype(str).to_numpy()
+    roc_df, pr_df, roc_auc, pr_auc = compute_curve_metrics(
+        scores=scores,
+        y_true=y_true,
+        positive_label=args.positive_label,
+        rule=args.rule,
+    )
+
     sweep_path = output_dir / "threshold_sweep.csv"
     best_path = output_dir / "best_threshold.json"
     summary_path = output_dir / "threshold_summary.txt"
+    roc_path = output_dir / "roc_curve.csv"
+    pr_path = output_dir / "pr_curve.csv"
+    zone_path = output_dir / "zone_policy.csv"
 
     sweep.to_csv(sweep_path, index=False, encoding="utf-8")
+    roc_df.to_csv(roc_path, index=False, encoding="utf-8")
+    pr_df.to_csv(pr_path, index=False, encoding="utf-8")
 
     best_payload = {
         "input": str(input_path),
@@ -293,11 +459,55 @@ def main() -> int:
             if k != "threshold"
         },
         "n_samples": int(n_labeled),
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
     }
     best_path.write_text(
         json.dumps(best_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    zone_lines = []
+    if args.review_threshold is not None and args.block_threshold is not None:
+        zone_df = build_zone_policy_table(
+            scores=scores,
+            y_true=y_true,
+            positive_label=args.positive_label,
+            negative_label=args.negative_label,
+            rule=args.rule,
+            review_threshold=args.review_threshold,
+            block_threshold=args.block_threshold,
+        )
+        zone_df.to_csv(zone_path, index=False, encoding="utf-8")
+        zone_lines = [
+            "",
+            "Zone policy",
+            f"  review_threshold = {args.review_threshold:.6f}",
+            f"  block_threshold  = {args.block_threshold:.6f}",
+            zone_df.to_string(index=False),
+        ]
+
+    if not args.skip_plots and plt is not None:
+        plot_curve(
+            roc_df,
+            x_col="fpr",
+            y_col="tpr",
+            title=f"ROC Curve (AUC={roc_auc:.4f})",
+            x_label="False Positive Rate",
+            y_label="True Positive Rate",
+            output_path=output_dir / "roc_curve.png",
+            diagonal=True,
+        )
+        plot_curve(
+            pr_df.dropna(subset=["threshold_score"]),
+            x_col="recall",
+            y_col="precision",
+            title=f"Precision-Recall Curve (AP={pr_auc:.4f})",
+            x_label="Recall",
+            y_label="Precision",
+            output_path=output_dir / "pr_curve.png",
+            diagonal=False,
+        )
 
     top = sweep.head(max(args.top_k, 1))
     lines = [
@@ -307,6 +517,8 @@ def main() -> int:
         f"Optimize metric : {args.optimize}",
         f"Decision rule   : {args.positive_label} if score "
         f"{'>=' if args.rule == 'greater_equal' else '<='} threshold",
+        f"ROC AUC         : {roc_auc:.4f}",
+        f"PR AUC          : {pr_auc:.4f}",
         "",
         "Best threshold",
         f"  threshold          = {best_payload['best_threshold']:.6f}",
@@ -326,9 +538,12 @@ def main() -> int:
         f"Files:",
         f"  {sweep_path}",
         f"  {best_path}",
+        f"  {roc_path}",
+        f"  {pr_path}",
         "",
         "Top thresholds",
         top.to_string(index=False),
+        *zone_lines,
         "",
     ]
     summary_path.write_text("\n".join(lines), encoding="utf-8")

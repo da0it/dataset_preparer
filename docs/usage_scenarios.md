@@ -152,6 +152,10 @@ python optimize_threshold.py \
 - `threshold_search_svm/threshold_sweep.csv` — все проверенные threshold и метрики
 - `threshold_search_svm/best_threshold.json` — лучший threshold и итоговые метрики
 - `threshold_search_svm/threshold_summary.txt` — короткая текстовая сводка
+- `threshold_search_svm/roc_curve.csv` — точки ROC-кривой
+- `threshold_search_svm/pr_curve.csv` — точки Precision-Recall-кривой
+- `threshold_search_svm/roc_curve.png` — ROC-график
+- `threshold_search_svm/pr_curve.png` — PR-график
 
 Для несбалансированного validation-набора обычно полезно также проверить:
 
@@ -167,6 +171,27 @@ python optimize_threshold.py \
   --rule greater_equal \
   --optimize balanced_accuracy
 ```
+
+Если нужно обосновать зоны `block / review / allow`:
+
+```bash
+python optimize_threshold.py \
+  -i diagnostics_25_calls_svm.csv \
+  -o threshold_search_svm_policy \
+  --sep "," \
+  --score-col confidence \
+  --label-col manual_label \
+  --positive-label spam \
+  --negative-label non_spam \
+  --rule greater_equal \
+  --optimize balanced_accuracy \
+  --review-threshold -0.55 \
+  --block-threshold -0.40
+```
+
+Результат:
+
+- `zone_policy.csv` — покрытие и состав зон `block / review / allow`
 
 ## 10. Инференс SVM по реальным звонкам
 
