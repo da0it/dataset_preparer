@@ -287,7 +287,6 @@ def fit_stacker(
         model = LogisticRegression(
             max_iter=2000,
             class_weight="balanced",
-            multi_class="auto",
             random_state=42,
         )
     model.fit(meta_features, y_meta)
