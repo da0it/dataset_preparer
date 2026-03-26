@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,14 @@ def set_global_seed(seed: int) -> None:
             torch.cuda.manual_seed_all(seed)
     except Exception:
         pass
+
+
+def _force_pytorch_transformers_backend() -> None:
+    # `Trainer` in some transformers builds still tries to touch TF/Keras integrations
+    # during import, even for pure PyTorch workflows. Force-disable those backends first.
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+    os.environ.setdefault("USE_FLAX", "0")
 
 
 def _json_dump(path: Path, payload: dict[str, Any]) -> None:
@@ -149,6 +158,7 @@ def convert_rubert_to_longformer(
     seed: int = 42,
 ):
     set_global_seed(seed)
+    _force_pytorch_transformers_backend()
 
     try:
         import torch
@@ -274,6 +284,7 @@ def freeze_longformer_for_mlm(model, freeze_mode: str) -> dict[str, int]:
 
 
 def build_global_attention_collator(tokenizer, mlm_probability: float):
+    _force_pytorch_transformers_backend()
     try:
         import torch
         from transformers import DataCollatorForLanguageModeling
@@ -356,6 +367,7 @@ def build_mixed_length_dataset(
 
 def run_mlm_training(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
+    _force_pytorch_transformers_backend()
 
     try:
         from transformers import (
