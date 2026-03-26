@@ -52,6 +52,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
 import argparse
 import contextlib
 import json
+import random
 import re
 import sys
 import time
@@ -112,6 +113,18 @@ RESOURCE_MAP = {
     "embeddings":   "средние",
     "transformers": "высокие",
 }
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
 def print_gpu_info() -> None:
@@ -766,6 +779,7 @@ def _finetune_transformer(
     early_stopping_metric: str = "f1",
     save_model: bool = True,
     silent: bool = False,
+    seed: int = 42,
 ):
     """
     Fine-tuning AutoModelForSequenceClassification (RuBERT или XLM-RoBERTa).
@@ -791,6 +805,8 @@ def _finetune_transformer(
         print(f"\n  [{friendly_name}]  ПРОПУСК — {e}")
         print("    Установка: pip install transformers torch accelerate")
         return
+
+    set_global_seed(seed)
 
     def _load_tokenizer(model_ref: str):
         return AutoTokenizer.from_pretrained(model_ref)
@@ -1128,6 +1144,7 @@ def run_transformer_models(
     extra_models: list = None,
     max_length: int = 256,
     cv: int = 0,
+    seed: int = 42,
 ):
     """
     3.3.2 Модели на основе трансформеров.
@@ -1168,6 +1185,7 @@ def run_transformer_models(
         early_stopping=early_stopping,
         early_stopping_metric=early_stopping_metric,
         max_length=max_length,
+        seed=seed,
     )
 
     for model_id, name in models:
@@ -1177,7 +1195,7 @@ def run_transformer_models(
             from sklearn.model_selection import StratifiedKFold
             X_all = np.array(list(X_train) + list(X_test))
             y_all = np.array(list(y_train) + list(y_test))
-            skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+            skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
             fold_scores = []
             print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
             for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
@@ -1309,7 +1327,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
         print(f"    {cls:<35} {cnt:>4}  {'█' * min(cnt, 40)}")
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=42, stratify=y
+        X, y, test_size=TEST_SIZE, random_state=args.seed, stratify=y
     )
     print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
@@ -1356,6 +1374,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             extra_models=args.extra_models,
             max_length=args.max_length,
             cv=args.cv,
+            seed=args.seed,
         )
 
     # ── 3.4 ──────────────────────────────────────────────────────────────────
@@ -1462,6 +1481,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--cv", type=int, default=0,
                         help="Кросс-валидация для baseline моделей: число фолдов (default: 0 = выкл). "
                              "Рекомендуется 5 для малых датасетов")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for split / CV / transformer fine-tuning (default: 42)")
     parser.add_argument("--extra-models", type=lambda s: s.split(","), default=None,
                         help="Дополнительные HuggingFace модели через запятую. "
                              "Формат: model/id или model/id:Название. "
