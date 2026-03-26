@@ -75,6 +75,7 @@ from dataset_tools.dataset_variants import (
     save_prepared_dataset,
 )
 from training_tools.legacy_baseline import build_legacy_baseline_pipelines
+from training_tools.tokenization_utils import encode_text_batch, save_inference_config
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
@@ -768,6 +769,7 @@ def _finetune_transformer(
     epochs: int = 3,
     batch_size: int = 16,
     max_length: int = 256,
+    truncation_strategy: str = "head",
     lr: float = 2e-5,
     fp16: bool = False,
     bf16: bool = False,
@@ -851,12 +853,11 @@ def _finetune_transformer(
 
     def collate_fn(batch):
         texts, labels = zip(*batch)
-        enc = tokenizer(
+        enc = encode_text_batch(
+            tokenizer,
             list(texts),
-            truncation=True,
             max_length=max_length,
-            padding=True,
-            return_tensors="pt",
+            truncation_strategy=truncation_strategy,
         )
         return enc, torch.tensor(labels, dtype=torch.long)
 
@@ -1093,6 +1094,7 @@ def _finetune_transformer(
         "grad_accum": grad_accum,
         "effective_batch_size": batch_size * grad_accum,
         "max_length": max_length,
+        "truncation_strategy": truncation_strategy,
         "learning_rate": lr,
         "fp16": fp16,
         "bf16": bf16,
@@ -1119,6 +1121,7 @@ def _finetune_transformer(
         model.save_pretrained(str(model_out))
         tokenizer.save_pretrained(str(model_out))
         joblib.dump(le, model_out / "label_encoder.joblib")
+        save_inference_config(model_out, max_length, truncation_strategy)
         print(f"    Сохранено: {model_out.name}/")
 
     return f1
@@ -1143,6 +1146,7 @@ def run_transformer_models(
     early_stopping_metric: str = "f1",
     extra_models: list = None,
     max_length: int = 256,
+    truncation_strategy: str = "head",
     cv: int = 0,
     seed: int = 42,
 ):
@@ -1185,6 +1189,7 @@ def run_transformer_models(
         early_stopping=early_stopping,
         early_stopping_metric=early_stopping_metric,
         max_length=max_length,
+        truncation_strategy=truncation_strategy,
         seed=seed,
     )
 
@@ -1395,6 +1400,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             early_stopping_metric=args.early_stopping_metric,
             extra_models=args.extra_models,
             max_length=args.max_length,
+            truncation_strategy=args.truncation_strategy,
             cv=args.cv,
             seed=args.seed,
         )
@@ -1502,6 +1508,12 @@ def main(argv: list[str] | None = None):
                         help="Макс. длина последовательности для трансформеров (default: 256, "
                              "макс: 512). Увеличение до 512 захватывает больше контекста, "
                              "но требует больше VRAM и замедляет обучение")
+    parser.add_argument("--truncation-strategy",
+                        choices=["head", "head_tail", "middle_cut"],
+                        default="head",
+                        help="Стратегия усечения длинных текстов: "
+                             "head = оставить начало; "
+                             "head_tail/middle_cut = оставить начало и конец, вырезать середину")
     parser.add_argument("--cv", type=int, default=0,
                         help="Кросс-валидация для baseline моделей: число фолдов (default: 0 = выкл). "
                              "Рекомендуется 5 для малых датасетов")

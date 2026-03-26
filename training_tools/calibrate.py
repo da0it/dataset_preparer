@@ -56,6 +56,7 @@ from scipy.special import softmax
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import label_binarize
+from training_tools.tokenization_utils import encode_text_batch, resolve_inference_config
 
 warnings.filterwarnings("ignore")
 
@@ -299,7 +300,8 @@ def load_model_and_tokenizer(model_dir: Path):
 
 
 def get_logits(model, tokenizer, texts: list, device,
-               batch_size: int = 32, max_length: int = 256) -> np.ndarray:
+               batch_size: int = 32, max_length: int = 256,
+               truncation_strategy: str = "head") -> np.ndarray:
     """Прогоняет тексты через модель, возвращает numpy-матрицу logits."""
     import torch
     all_logits = []
@@ -307,12 +309,11 @@ def get_logits(model, tokenizer, texts: list, device,
 
     for start in range(0, len(texts), batch_size):
         batch = texts[start: start + batch_size]
-        enc   = tokenizer(
+        enc = encode_text_batch(
+            tokenizer,
             batch,
-            truncation=True,
             max_length=max_length,
-            padding=True,
-            return_tensors="pt",
+            truncation_strategy=truncation_strategy,
         )
         enc = {k: v.to(device) for k, v in enc.items()}
         with torch.no_grad():
@@ -369,6 +370,10 @@ def main():
                         help="Размер батча при инференсе (по умолчанию: 32)")
     parser.add_argument("--max-length", type=int, default=256,
                         help="Макс. длина токенов (по умолчанию: 256)")
+    parser.add_argument("--truncation-strategy",
+                        choices=["head", "head_tail", "middle_cut"],
+                        default="head",
+                        help="Fallback-стратегия усечения, если рядом с моделью нет inference_config.json")
     parser.add_argument("--n-bins", type=int, default=10,
                         help="Число корзин для ECE / reliability diagram (по умолчанию: 10)")
     args = parser.parse_args()
@@ -386,11 +391,16 @@ def main():
         return
 
     model_name = model_dir.name
+    effective_max_length, effective_truncation_strategy = resolve_inference_config(
+        model_dir, args.max_length, args.truncation_strategy
+    )
 
     print(f"\n{'=' * 60}")
     print(f"  Калибровка: {model_name}")
     print(f"  Таргет:     {args.target}")
     print(f"  Тиры:       {args.tiers}")
+    print(f"  Tokenizer:  max_length={effective_max_length}, "
+          f"truncation={effective_truncation_strategy}")
     print(f"{'=' * 60}\n")
 
     # ── Загрузка модели ────────────────────────────────────────────────────────
@@ -405,8 +415,15 @@ def main():
 
     # ── Инференс -> logits ────────────────────────────────────────────────────
     print("  Инференс (получение logits)...")
-    logits = get_logits(model, tokenizer, X_test, device,
-                        batch_size=args.batch_size, max_length=args.max_length)
+    logits = get_logits(
+        model,
+        tokenizer,
+        X_test,
+        device,
+        batch_size=args.batch_size,
+        max_length=effective_max_length,
+        truncation_strategy=effective_truncation_strategy,
+    )
 
     # ── До калибровки ─────────────────────────────────────────────────────────
     proba_before  = softmax(logits, axis=1)

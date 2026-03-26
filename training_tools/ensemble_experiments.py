@@ -24,6 +24,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from training_tools.tokenization_utils import encode_text_batch, resolve_inference_config
+
 try:
     import joblib
     import matplotlib
@@ -81,6 +83,10 @@ def parse_args() -> argparse.Namespace:
                         help="Batch size for transformer inference.")
     parser.add_argument("--max-length", type=int, default=512,
                         help="Max sequence length for transformer inference.")
+    parser.add_argument("--truncation-strategy",
+                        choices=["head", "head_tail", "middle_cut"],
+                        default="head",
+                        help="Fallback truncation strategy if model_dir has no inference_config.json")
     parser.add_argument("--sklearn-model", action="append", default=[],
                         help="Saved sklearn model spec: Name=/abs/path/model.joblib")
     parser.add_argument("--transformer-model", action="append", default=[],
@@ -165,6 +171,7 @@ def predict_transformer_proba(
     labels: list[str],
     batch_size: int,
     max_length: int,
+    truncation_strategy: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     import torch
     from transformers import AutoModelForSequenceClassification
@@ -175,6 +182,9 @@ def predict_transformer_proba(
     le = joblib.load(le_path)
     tokenizer = _load_tokenizer(str(model_dir))
     model = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
+    effective_max_length, effective_truncation_strategy = resolve_inference_config(
+        model_dir, max_length, truncation_strategy
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -184,12 +194,11 @@ def predict_transformer_proba(
     text_list = list(texts)
     for start in range(0, len(text_list), batch_size):
         batch = text_list[start:start + batch_size]
-        enc = tokenizer(
+        enc = encode_text_batch(
+            tokenizer,
             batch,
-            truncation=True,
-            padding=True,
-            max_length=max_length,
-            return_tensors="pt",
+            max_length=effective_max_length,
+            truncation_strategy=effective_truncation_strategy,
         )
         enc = {k: v.to(device) for k, v in enc.items()}
         with torch.no_grad():
@@ -214,6 +223,7 @@ def collect_model_outputs(
     labels: list[str],
     batch_size: int,
     max_length: int,
+    truncation_strategy: str,
 ) -> tuple[list[str], np.ndarray, dict[str, np.ndarray]]:
     names = []
     probas = []
@@ -222,7 +232,14 @@ def collect_model_outputs(
         if spec.kind == "sklearn":
             proba, pred = predict_sklearn_proba(spec.path, texts, labels)
         else:
-            proba, pred = predict_transformer_proba(spec.path, texts, labels, batch_size, max_length)
+            proba, pred = predict_transformer_proba(
+                spec.path,
+                texts,
+                labels,
+                batch_size,
+                max_length,
+                truncation_strategy,
+            )
         names.append(spec.name)
         probas.append(proba)
         pred_map[spec.name] = pred
@@ -336,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     test_texts, test_y = load_eval_frame(Path(args.test_input), args.target, args.sep)
     labels = sorted(test_y.unique())
     test_names, test_prob_stack, test_pred_map = collect_model_outputs(
-        specs, test_texts, labels, args.batch_size, args.max_length
+        specs, test_texts, labels, args.batch_size, args.max_length, args.truncation_strategy
     )
 
     results = []
@@ -381,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Stacking requires --meta-input.")
         meta_texts, meta_y = load_eval_frame(Path(args.meta_input), args.target, args.sep)
         _, meta_prob_stack, _ = collect_model_outputs(
-            specs, meta_texts, labels, args.batch_size, args.max_length
+            specs, meta_texts, labels, args.batch_size, args.max_length, args.truncation_strategy
         )
         X_meta_train = flatten_meta_features(meta_prob_stack)
         X_meta_test = flatten_meta_features(test_prob_stack)
