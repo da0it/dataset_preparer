@@ -120,6 +120,33 @@ python ensemble.py \
   -o models_ensemble
 ```
 
+## 7.1 Дипломный эксперимент по ансамблям
+
+Ансамбли по уже обученным моделям: `soft`, `max`, `hard`, `stacking`.
+
+```bash
+python ensemble_experiments.py \
+  --meta-input ensemble_meta.csv \
+  --test-input ensemble_test.csv \
+  --target call_purpose \
+  --sep ";" \
+  --methods soft,max,hard,stacking \
+  --stacker mlp \
+  --sklearn-model "TF-IDF+SVM=/path/to/TF-IDF_plus_SVM.joblib" \
+  --sklearn-model "TF-IDF+LogReg=/path/to/TF-IDF_plus_LogReg.joblib" \
+  --transformer-model "RuBERT=/path/to/RuBERT" \
+  --transformer-model "ruBert-base=/path/to/ruBert-base" \
+  -o ensemble_diploma
+```
+
+Результат:
+
+- `ensemble_comparison.csv` — сравнение base-моделей и ансамблей
+- `ensemble_predictions.csv` — предсказания по объектам
+- `ensemble_summary.json` — итоговый лог
+- `cm_*.png` — confusion matrices
+- `stacker_mlp.joblib` — meta-model для stacking
+
 ## 8. Калибровка трансформера
 
 ```bash
