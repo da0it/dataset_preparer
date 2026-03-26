@@ -793,10 +793,7 @@ def _finetune_transformer(
         return
 
     def _load_tokenizer(model_ref: str):
-        try:
-            return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
-        except TypeError:
-            return AutoTokenizer.from_pretrained(model_ref)
+        return AutoTokenizer.from_pretrained(model_ref)
 
     print(f"\n  [{friendly_name}]  модель: {model_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

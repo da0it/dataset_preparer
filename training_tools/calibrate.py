@@ -279,10 +279,7 @@ def load_model_and_tokenizer(model_dir: Path):
         raise FileNotFoundError(f"label_encoder.joblib не найден в {model_dir}")
 
     def _load_tokenizer(model_ref: str):
-        try:
-            return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
-        except TypeError:
-            return AutoTokenizer.from_pretrained(model_ref)
+        return AutoTokenizer.from_pretrained(model_ref)
 
     le        = joblib.load(le_path)
     tokenizer = _load_tokenizer(str(model_dir))
