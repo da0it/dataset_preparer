@@ -28,6 +28,15 @@ python prepare_dataset.py \
   --output dataset_clean.csv
 ```
 
+Если нужен один и тот же лемматизированный `text` для всех последующих моделей:
+
+```bash
+python prepare_dataset.py \
+  --input dataset.csv \
+  --output dataset_clean.csv \
+  --lemmatize
+```
+
 ### 2.2 Удаление шумовых фраз
 
 ```bash
@@ -277,7 +286,7 @@ df["pred"]=preds; df["score"]=scores; out=df[["filename","text","pred","score"]]
 
 ```bash
 python transcribe.py --input /path/to/mp3_dir --output real_calls.csv --device cuda --compute-type float16 && \
-python prepare_dataset.py --input real_calls.csv --output real_calls_clean.csv && \
+python prepare_dataset.py --input real_calls.csv --output real_calls_clean.csv --lemmatize && \
 python dataset_cli.py clean-noise --input real_calls_clean.csv --output real_calls_clean_no_noise.csv && \
 python -c 'import joblib, pandas as pd; model = joblib.load("models_binary/call_purpose/TF-IDF_plus_SVM.joblib"); df = pd.read_csv("real_calls_clean_no_noise.csv", dtype=str).fillna(""); df["pred"] = model.predict(df["text"]); df["score"] = model.decision_function(df["text"]); out = df[["filename","text","pred","score"]]; out.to_csv("real_calls_pred.csv", index=False, encoding="utf-8"); print(out.to_string(index=False))'
 ```

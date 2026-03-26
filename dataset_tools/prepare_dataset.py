@@ -7,9 +7,10 @@ Steps applied to each text:
                     → replaced with readable [PLACEHOLDER] tokens
   2. NER redaction — person names, org names, locations via Stanza
                      + pymorphy3 dictionary fallback for names
-  3. Normalization — unicode cleanup, lowercasing, whitespace collapse
+  3. Optional lemmatization — stanza tokenize+pos+lemma
+  4. Normalization — unicode cleanup, lowercasing, whitespace collapse
                      (punctuation and meaningful words are preserved)
-  4. Length filter — rows with too little text after cleaning are flagged
+  5. Length filter — rows with too little text after cleaning are flagged
 
 Design principles for Russian transcription data:
   - Punctuation inside text is kept (helps with sentence structure)
@@ -23,6 +24,7 @@ Design principles for Russian transcription data:
 Usage:
     python prepare_dataset.py --input dataset.csv --output dataset_clean.csv
     python prepare_dataset.py --input dataset.csv --output dataset_clean.csv --min-tokens 5
+    python prepare_dataset.py --input dataset.csv --output dataset_clean_lemma.csv --lemmatize
 
     # Re-run cleaning on already-cleaned file, starting from row 223 (0-based),
     # reading source text from 'text_original' column:
@@ -43,26 +45,59 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-# ── Stanza (Russian NER) ─────────────────────────────────────────────────────
+# ── Stanza (Russian NER / lemmatization) ─────────────────────────────────────
 try:
     import stanza
     from stanza import DownloadMethod
-    _nlp_stanza = stanza.Pipeline(
-        "ru",
-        processors="tokenize,ner",
-        download_method=DownloadMethod.REUSE_RESOURCES,
-        verbose=False,
-    )
-    _STANZA_OK = True
+    _STANZA_IMPORT_OK = True
+    _STANZA_IMPORT_ERROR = None
 except Exception as e:
-    _STANZA_OK = False
-    _nlp_stanza = None
+    _STANZA_IMPORT_OK = False
+    _STANZA_IMPORT_ERROR = e
+    stanza = None
+    DownloadMethod = None
     print(
         f"Warning: stanza not available ({e}).\n"
-        "NER-based PII removal will be skipped.\n"
+        "NER-based PII removal and stanza lemmatization will be skipped.\n"
         'Install: pip install stanza && python -c "import stanza; stanza.download(\'ru\')"',
         file=sys.stderr,
     )
+
+_nlp_stanza_ner = None
+_nlp_stanza_lemma = None
+_STANZA_NER_ERROR = None
+_STANZA_LEMMA_ERROR = None
+
+
+def _load_stanza_pipeline(processors: str):
+    if not _STANZA_IMPORT_OK:
+        raise RuntimeError(_STANZA_IMPORT_ERROR)
+    return stanza.Pipeline(
+        "ru",
+        processors=processors,
+        download_method=DownloadMethod.REUSE_RESOURCES,
+        verbose=False,
+    )
+
+
+def _get_stanza_ner_pipeline():
+    global _nlp_stanza_ner, _STANZA_NER_ERROR
+    if _nlp_stanza_ner is None and _STANZA_NER_ERROR is None:
+        try:
+            _nlp_stanza_ner = _load_stanza_pipeline("tokenize,ner")
+        except Exception as exc:
+            _STANZA_NER_ERROR = exc
+    return _nlp_stanza_ner
+
+
+def _get_stanza_lemma_pipeline():
+    global _nlp_stanza_lemma, _STANZA_LEMMA_ERROR
+    if _nlp_stanza_lemma is None and _STANZA_LEMMA_ERROR is None:
+        try:
+            _nlp_stanza_lemma = _load_stanza_pipeline("tokenize,pos,lemma")
+        except Exception as exc:
+            _STANZA_LEMMA_ERROR = exc
+    return _nlp_stanza_lemma
 
 # ── pymorphy3 (lemmatization for name dictionary lookup) ────────────────────
 try:
@@ -254,7 +289,10 @@ def _ner_redact_stanza(text: str) -> str:
     Applied before lowercasing so capitalisation hints work properly.
     Replacements applied right-to-left to keep offsets valid.
     """
-    doc = _nlp_stanza(text)
+    nlp = _get_stanza_ner_pipeline()
+    if nlp is None:
+        return text
+    doc = nlp(text)
     entities = []
     for sent in doc.sentences:
         for ent in sent.entities:
@@ -293,6 +331,68 @@ def _regex_fallback_redact(text: str) -> str:
     text = _org_re_sub(text)
     text = _name_lemma_redact(text)
     return text
+
+
+_PLACEHOLDER_ESCAPE_MAP = {
+    placeholder: f"codexplaceholder{idx}"
+    for idx, placeholder in enumerate(sorted(set(PLACEHOLDER.values())))
+}
+_PLACEHOLDER_RESTORE_MAP = {
+    marker: placeholder
+    for placeholder, marker in _PLACEHOLDER_ESCAPE_MAP.items()
+}
+
+
+def _escape_placeholders(text: str) -> str:
+    escaped = text
+    for placeholder, marker in _PLACEHOLDER_ESCAPE_MAP.items():
+        escaped = escaped.replace(placeholder, marker)
+    return escaped
+
+
+def _restore_placeholders(text: str) -> str:
+    restored = text
+    for marker, placeholder in _PLACEHOLDER_RESTORE_MAP.items():
+        restored = restored.replace(marker, placeholder)
+    return restored
+
+
+def _lemmatize_stanza(text: str) -> str:
+    """
+    Lemmatize only token spans and keep original punctuation / spacing intact.
+    Placeholder markers are temporarily escaped so stanza does not split them.
+    """
+    nlp = _get_stanza_lemma_pipeline()
+    if nlp is None:
+        return text
+
+    escaped = _escape_placeholders(text)
+    doc = nlp(escaped)
+    chars = list(escaped)
+    replacements = []
+
+    for sent in doc.sentences:
+        for token in sent.tokens:
+            start = getattr(token, "start_char", None)
+            end = getattr(token, "end_char", None)
+            if start is None or end is None:
+                continue
+            if token.text in _PLACEHOLDER_RESTORE_MAP:
+                continue
+
+            lemmas = []
+            for word in token.words:
+                lemma = getattr(word, "lemma", None) or getattr(word, "text", "")
+                if lemma:
+                    lemmas.append(lemma)
+            replacement = " ".join(lemmas).strip()
+            if replacement and replacement != token.text:
+                replacements.append((start, end, replacement))
+
+    for start, end, replacement in reversed(replacements):
+        chars[start:end] = list(replacement)
+
+    return _restore_placeholders("".join(chars))
 
 
 # ── PII cleaning ─────────────────────────────────────────────────────────────
@@ -344,7 +444,7 @@ def normalize(text: str) -> str:
 
 # ── Full pipeline per row ─────────────────────────────────────────────────────
 
-def process_text(text: str, use_ner: bool) -> str:
+def process_text(text: str, use_ner: bool, lemmatize: bool) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
     if text.startswith("[TRANSCRIPTION_ERROR"):
@@ -354,7 +454,7 @@ def process_text(text: str, use_ner: bool) -> str:
     text = remove_pii_regex(text)
 
     # Step 2: Stanza NER — must run BEFORE lowercasing (capitalisation matters)
-    if use_ner and _STANZA_OK:
+    if use_ner and _get_stanza_ner_pipeline() is not None:
         try:
             text = _ner_redact_stanza(text)
         except Exception as exc:
@@ -364,7 +464,15 @@ def process_text(text: str, use_ner: bool) -> str:
     # Step 3: Regex + pymorphy3 fallback for names/orgs Stanza missed
     text = _regex_fallback_redact(text)
 
-    # Step 4: Normalize (lowercase + cleanup) — after NER
+    # Step 4: Optional lemmatization on cleaned text, before lowercasing/cleanup
+    if lemmatize:
+        try:
+            text = _lemmatize_stanza(text)
+        except Exception as exc:
+            print(f"Warning: Stanza lemmatization failed on a row ({exc}), skipping it.",
+                  file=sys.stderr)
+
+    # Step 5: Normalize (lowercase + cleanup) — after NER/lemma
     text = normalize(text)
 
     return text
@@ -384,6 +492,8 @@ def main():
                         help="Minimum token count after cleaning (default: 3)")
     parser.add_argument("--no-ner", action="store_true",
                         help="Skip NER-based PII removal (faster, but misses names/orgs)")
+    parser.add_argument("--lemmatize", action="store_true",
+                        help="Apply stanza lemmatization to the cleaned text before saving it.")
     parser.add_argument("--source-column", default="text",
                         help="Column to read source text from (default: text). "
                              "Pass 'text_original' to re-clean from raw transcription.")
@@ -425,10 +535,20 @@ def main():
 
     use_ner = not args.no_ner
     if use_ner:
-        if _STANZA_OK:
+        if _get_stanza_ner_pipeline() is not None:
             print("Stanza NER ready (ru wikiner).")
         else:
-            print("Warning: Stanza not available, NER skipped.", file=sys.stderr)
+            print(f"Warning: Stanza NER not available ({_STANZA_NER_ERROR}), NER skipped.",
+                  file=sys.stderr)
+    if args.lemmatize:
+        if _get_stanza_lemma_pipeline() is not None:
+            print("Stanza lemmatizer ready (ru tokenize+pos+lemma).")
+        else:
+            print(
+                f"Warning: Stanza lemmatizer not available ({_STANZA_LEMMA_ERROR}), "
+                "lemmatization skipped.",
+                file=sys.stderr,
+            )
     if _MORPH_OK:
         print("pymorphy3 lemmatizer ready.")
 
@@ -448,7 +568,7 @@ def main():
 
     df.loc[df.index[start_row:], "text"] = (
         df.loc[df.index[start_row:], src_col]
-        .progress_apply(lambda t: process_text(t, use_ner))
+        .progress_apply(lambda t: process_text(t, use_ner, args.lemmatize))
     )
 
     if "too_short" not in df.columns:

@@ -17,6 +17,12 @@ python dataset_cli.py clean-noise --input dataset_clean.csv --output dataset_rea
 python train_advanced.py -i dataset_ready.csv -g baseline,rubert,xlmr -t call_purpose
 ```
 
+Если нужен единый лемматизированный текст для всех моделей, используй:
+
+```bash
+python prepare_dataset.py --input dataset.csv --output dataset_clean.csv --lemmatize
+```
+
 `train_advanced.py` теперь является основной точкой входа для обучения.
 `train.py` оставлен только как совместимая обертка для старого набора классических моделей
 и внутри делегирует запуск в `train_advanced.py -g legacy-baseline`.
