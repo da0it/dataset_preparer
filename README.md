@@ -6,6 +6,7 @@
 - очистки и подготовки CSV (`prepare_dataset.py`, `dataset_cli.py`)
 - обучения моделей (`train.py`, `train_advanced.py`, `ensemble.py`)
 - калибровки трансформеров (`calibrate.py`)
+- конвертации `RuBERT -> Longformer` и MLM-дообучения (`rubert_longformer.py`)
 
 ## Основной пайплайн
 
@@ -49,6 +50,42 @@ python dataset_cli.py filter-ready --input dataset.csv --output dataset_ready.cs
 Основные сценарии и готовые команды собраны в
 [`docs/usage_scenarios.md`](/Users/dmitrii/dataset_preparer/docs/usage_scenarios.md).
 
+## Longformer из обычного RuBERT
+
+Для длинных текстов теперь есть отдельная утилита, которая:
+
+- берет обычный BERT-style чекпоинт (`DeepPavlov/rubert-base-cased` по умолчанию),
+- разворачивает position embeddings на длинный контекст,
+- копирует локальный attention в global attention,
+- сохраняет готовый `LongformerForMaskedLM`,
+- умеет продолжить MLM-дообучение на длинных текстах.
+
+### 1. Конвертация RuBERT в Longformer
+
+```bash
+python3 rubert_longformer.py convert \
+  --source-model DeepPavlov/rubert-base-cased \
+  --output-dir models/rubert-longformer-4096 \
+  --max-length 4096 \
+  --attention-window 512
+```
+
+### 2. MLM-дообучение на длинных текстах
+
+```bash
+python3 rubert_longformer.py mlm \
+  --model-dir models/rubert-longformer-4096 \
+  --train-file data/long_corpus.txt \
+  --validation-file data/long_corpus_valid.txt \
+  --output-dir models/rubert-longformer-4096-mlm \
+  --max-length 4096 \
+  --char-window 20000 \
+  --batch-size 1 \
+  --grad-accum 8 \
+  --learning-rate 6e-4 \
+  --gradient-checkpointing
+```
+
 ## Структура репозитория
 
 - `dataset_tools/` — реальные реализации подготовки и обработки CSV
@@ -73,6 +110,7 @@ python dataset_cli.py filter-ready --input dataset.csv --output dataset_ready.cs
 - `train.py` — legacy wrapper для совместимости (`legacy-baseline`)
 - `ensemble.py` — soft-voting ансамбль
 - `calibrate.py` — temperature scaling для transformer-моделей
+- `rubert_longformer.py` — конвертация `RuBERT -> Longformer` и MLM на длинных текстах
 
 ### Исследования ASR
 

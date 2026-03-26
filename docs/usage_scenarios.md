@@ -157,7 +157,43 @@ python calibrate.py \
   --sep ","
 ```
 
-## 9. Подбор threshold для spam-gate
+## 9. Конвертация обычного RuBERT в Longformer
+
+```bash
+python3 rubert_longformer.py convert \
+  --source-model DeepPavlov/rubert-base-cased \
+  --output-dir models/rubert-longformer-4096 \
+  --max-length 4096 \
+  --attention-window 512
+```
+
+Результат:
+
+- `models/rubert-longformer-4096/` — готовый Longformer checkpoint
+- `models/rubert-longformer-4096/conversion_summary.json` — сводка по конвертации
+
+## 10. MLM-дообучение Longformer на длинных текстах
+
+```bash
+python3 rubert_longformer.py mlm \
+  --model-dir models/rubert-longformer-4096 \
+  --train-file data/long_corpus.txt \
+  --validation-file data/long_corpus_valid.txt \
+  --output-dir models/rubert-longformer-4096-mlm \
+  --max-length 4096 \
+  --char-window 20000 \
+  --batch-size 1 \
+  --grad-accum 8 \
+  --learning-rate 6e-4 \
+  --gradient-checkpointing
+```
+
+Результат:
+
+- `models/rubert-longformer-4096-mlm/` — чекпоинт после MLM
+- `models/rubert-longformer-4096-mlm/mlm_training_summary.json` — параметры запуска
+
+## 11. Подбор threshold для spam-gate
 
 Точный подбор decision threshold по размеченному validation / diagnostic CSV.
 
