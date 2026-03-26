@@ -113,9 +113,12 @@ def load_eval_frame(csv_path: Path, target: str, sep: str) -> tuple[pd.Series, p
 def _load_tokenizer(model_ref: str):
     from transformers import AutoTokenizer
     try:
-        return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
-    except TypeError:
         return AutoTokenizer.from_pretrained(model_ref)
+    except TypeError as exc:
+        msg = str(exc)
+        if "BertPreTokenizer" in msg or "pre_tokenizer" in msg:
+            return AutoTokenizer.from_pretrained(model_ref, use_fast=False)
+        raise
 
 
 def _softmax_nd(arr: np.ndarray) -> np.ndarray:
