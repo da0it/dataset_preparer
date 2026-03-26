@@ -1326,10 +1326,32 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
     for cls, cnt in y.value_counts().items():
         print(f"    {cls:<35} {cnt:>4}  {'█' * min(cnt, 40)}")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=args.seed, stratify=y
-    )
-    print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
+    if args.eval_input is not None:
+        try:
+            prepared_eval_df = prepare_dataset(args.eval_df, target, dataset_variant)
+        except ValueError as e:
+            print(f"  Пропуск eval split: {e}")
+            return
+
+        train_labels = set(y.unique())
+        prepared_eval_df = prepared_eval_df[prepared_eval_df[target].isin(train_labels)].copy()
+        if prepared_eval_df.empty:
+            print("  Пропуск: eval split не содержит ни одного класса из train split.")
+            return
+
+        eval_snapshot_path = target_dir / "dataset_eval_prepared.csv"
+        save_prepared_dataset(prepared_eval_df, eval_snapshot_path, sep=args.sep)
+        print(f"  Prepared eval dataset: {eval_snapshot_path}")
+
+        X_train, y_train = X, y
+        X_test = prepared_eval_df["text"].reset_index(drop=True)
+        y_test = prepared_eval_df[target].reset_index(drop=True)
+        print(f"\n  Train(fixed): {len(X_train)}  |  Eval(fixed): {len(X_test)}")
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=args.seed, stratify=y
+        )
+        print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
     groups = set(g.strip() for g in args.groups.split(","))
     run_all = "all" in groups
@@ -1435,6 +1457,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--binary-input", default=None,
                         help="Опциональный второй CSV для spam/non-spam. "
                              "Все call_purpose != spam будут схлопнуты в non_spam.")
+    parser.add_argument("--eval-input", default=None,
+                        help="Фиксированный validation/test CSV. Если задан, внутренний train_test_split отключается.")
 
     # ── Эмбеддинги ────────────────────────────────────────────────────────────
     parser.add_argument("--sbert-model",
@@ -1513,6 +1537,10 @@ def main(argv: list[str] | None = None):
         print("Ошибка: не используйте --binary-input вместе с --dataset-variant binary_spam.")
         return 1
 
+    if args.eval_input and args.binary_input:
+        print("Ошибка: --eval-input пока нельзя использовать вместе с --binary-input.")
+        return 1
+
     try:
         multiclass_df = load_training_frame(csv_path, sep=args.sep)
     except ValueError as exc:
@@ -1529,6 +1557,18 @@ def main(argv: list[str] | None = None):
             binary_df = load_training_frame(binary_path, sep=args.sep)
         except ValueError as exc:
             print(f"Ошибка: {exc}")
+            return 1
+
+    eval_path = Path(args.eval_input).resolve() if args.eval_input else None
+    args.eval_df = None
+    if eval_path is not None:
+        if not eval_path.exists():
+            print(f"Ошибка: файл eval '{eval_path}' не найден.")
+            return 1
+        try:
+            args.eval_df = load_training_frame(eval_path, sep=args.sep)
+        except ValueError as exc:
+            print(f"Ошибка eval split: {exc}")
             return 1
 
     targets = TARGETS if args.target == "all" else [args.target]
