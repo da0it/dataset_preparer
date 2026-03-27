@@ -152,6 +152,66 @@ def segments_to_speakers_text(segments: list[dict]) -> str:
     return " | ".join(parts)
 
 
+def build_role_map(
+    segments: list[dict],
+    first_speaker_role: str,
+    caller_label: str,
+    respondent_label: str,
+) -> dict[str, str]:
+    """
+    Map diarization speaker ids to conversational roles based on first appearance.
+
+    Example:
+      first seen speaker -> caller/respondent (configurable)
+      second seen speaker -> the opposite role
+    """
+    ordered_speakers: list[str] = []
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if not speaker or speaker == "UNKNOWN":
+            continue
+        if speaker not in ordered_speakers:
+            ordered_speakers.append(speaker)
+
+    if not ordered_speakers:
+        return {}
+
+    if first_speaker_role == "caller":
+        first_label, second_label = caller_label, respondent_label
+    else:
+        first_label, second_label = respondent_label, caller_label
+
+    role_map: dict[str, str] = {ordered_speakers[0]: first_label}
+    if len(ordered_speakers) >= 2:
+        role_map[ordered_speakers[1]] = second_label
+    for extra_speaker in ordered_speakers[2:]:
+        role_map[extra_speaker] = extra_speaker
+    return role_map
+
+
+def segments_to_roles_text(
+    segments: list[dict],
+    first_speaker_role: str,
+    caller_label: str,
+    respondent_label: str,
+) -> str:
+    role_map = build_role_map(
+        segments,
+        first_speaker_role=first_speaker_role,
+        caller_label=caller_label,
+        respondent_label=respondent_label,
+    )
+    parts: list[str] = []
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        start = seg.get("start", 0)
+        end = seg.get("end", 0)
+        speaker = seg.get("speaker", "UNKNOWN")
+        role = role_map.get(speaker, "UNKNOWN")
+        parts.append(f"[{start:.1f}-{end:.1f}] {role}: {text}")
+    return " | ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Transcription + diarization
 # ---------------------------------------------------------------------------
@@ -165,6 +225,10 @@ def transcribe_file(
     align_metadata,     # pre-loaded once before the loop, or None
     device: str,
     diarize_timeout_sec: int = 300,
+    speaker_label_mode: str = "raw",
+    first_speaker_role: str = "caller",
+    caller_label: str = "звонящий",
+    respondent_label: str = "ответчик",
 ) -> tuple[str, str, str | None]:
     """
     Transcribe and optionally diarize a single audio file.
@@ -219,7 +283,15 @@ def transcribe_file(
         signal.alarm(0)
         print(f"\n  [warn] diarization failed ({diar_exc}), speaker labels will be UNKNOWN")
 
-    speakers_text = segments_to_speakers_text(segments)
+    if speaker_label_mode == "roles":
+        speakers_text = segments_to_roles_text(
+            segments,
+            first_speaker_role=first_speaker_role,
+            caller_label=caller_label,
+            respondent_label=respondent_label,
+        )
+    else:
+        speakers_text = segments_to_speakers_text(segments)
     return plain_text, timed_text, speakers_text
 
 
@@ -275,6 +347,29 @@ def main():
         help="Max seconds to spend on diarization per file (default: 300). "
              "Files that exceed this limit get UNKNOWN speaker labels."
     )
+    parser.add_argument(
+        "--speaker-label-mode",
+        choices=["raw", "roles"],
+        default="raw",
+        help="How to render diarization labels in *_speakers.csv: "
+             "raw = SPEAKER_00/01, roles = звонящий/ответчик"
+    )
+    parser.add_argument(
+        "--first-speaker-role",
+        choices=["caller", "respondent"],
+        default="caller",
+        help="Role assigned to the first detected speaker when --speaker-label-mode roles is used."
+    )
+    parser.add_argument(
+        "--caller-label",
+        default="звонящий",
+        help="Display label for caller role (default: звонящий)"
+    )
+    parser.add_argument(
+        "--respondent-label",
+        default="ответчик",
+        help="Display label for respondent role (default: ответчик)"
+    )
 
     args = parser.parse_args()
 
@@ -296,6 +391,11 @@ def main():
     print(f"Model         : {args.model}")
     print(f"Language      : {args.language}")
     print(f"Diarization   : {'enabled' if diarize else 'disabled (no HF token)'}")
+    if diarize:
+        print(f"Speaker mode  : {args.speaker_label_mode}")
+        if args.speaker_label_mode == "roles":
+            print(f"First speaker : {args.first_speaker_role}")
+            print(f"Role labels   : {args.caller_label} / {args.respondent_label}")
     print(f"Plain CSV     : {plain_path}")
     print(f"Timed CSV     : {timed_path}")
     if diarize:
@@ -375,6 +475,10 @@ def main():
                     audio_path, model, args.language,
                     diarize_pipeline, align_model, align_metadata, device,
                     diarize_timeout_sec=args.diarize_timeout,
+                    speaker_label_mode=args.speaker_label_mode,
+                    first_speaker_role=args.first_speaker_role,
+                    caller_label=args.caller_label,
+                    respondent_label=args.respondent_label,
                 )
                 plain_writer.writerow(make_row(audio_path.name, plain_text))
                 timed_writer.writerow(make_row(audio_path.name, timed_text))

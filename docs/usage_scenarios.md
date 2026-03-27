@@ -18,6 +18,21 @@ python transcribe.py \
 - `dataset_timed.csv`
 - `dataset_speakers.csv` при включенной diarization
 
+Если нужен вывод ролей вместо `SPEAKER_00/01`:
+
+```bash
+python transcribe.py \
+  --input /path/to/mp3_dir \
+  --output dataset.csv \
+  --device cuda \
+  --compute-type float16 \
+  --hf-token $HF_TOKEN \
+  --speaker-label-mode roles \
+  --first-speaker-role caller
+```
+
+Тогда в `dataset_speakers.csv` будут метки `звонящий` / `ответчик`.
+
 ## 2. Полная подготовка датасета
 
 ### 2.1 Очистка текста и PII
