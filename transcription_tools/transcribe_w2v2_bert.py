@@ -113,8 +113,12 @@ def transcribe_audio(model_bundle: dict, audio_path: Path) -> str:
 
     with torch.no_grad():
         logits = model(input_values=input_values, attention_mask=attention_mask).logits
-    predicted_ids = torch.argmax(logits, dim=-1)
-    text = processor.batch_decode(predicted_ids)[0]
+    # ProcessorWithLM expects raw logits; plain CTC processors expect token ids.
+    if hasattr(processor, "decoder"):
+        text = processor.batch_decode(logits.cpu().numpy()).text[0]
+    else:
+        predicted_ids = torch.argmax(logits, dim=-1)
+        text = processor.batch_decode(predicted_ids)[0]
     return " ".join(str(text).strip().split())
 
 
