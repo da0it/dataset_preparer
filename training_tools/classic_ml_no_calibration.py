@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
                         help="How to interpret input dataset (default: multiclass)")
     parser.add_argument("--eval-input", default=None,
                         help="Optional fixed validation/test CSV.")
+    parser.add_argument("--cv", type=int, default=0,
+                        help="Optional number of CV folds for reporting (default: 0 = off).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for hold-out split (default: 42)")
     return parser.parse_args()
@@ -71,7 +73,7 @@ def build_non_calibrated_baselines():
     }
 
 
-def run_models(X_train, y_train, X_test, y_test, store: ResultStore, output_dir: Path) -> None:
+def run_models(X_train, y_train, X_test, y_test, store: ResultStore, output_dir: Path, cv: int = 0, seed: int = 42) -> None:
     print(f"\n{'═' * 60}")
     print("  Classical ML without calibration")
     print(f"{'═' * 60}")
@@ -79,6 +81,20 @@ def run_models(X_train, y_train, X_test, y_test, store: ResultStore, output_dir:
     for name, pipeline in build_non_calibrated_baselines().items():
         print(f"\n  [{name}]")
         try:
+            if cv >= 2:
+                from sklearn.model_selection import StratifiedKFold, cross_val_score
+                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+                X_all = list(X_train) + list(X_test)
+                y_all = list(y_train) + list(y_test)
+                cv_scores = cross_val_score(
+                    pipeline, X_all, y_all,
+                    cv=skf, scoring="f1_weighted", n_jobs=-1
+                )
+                print(
+                    f"    CV {cv}-fold F1: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}  "
+                    f"(folds: {', '.join(f'{s:.3f}' for s in cv_scores)})"
+                )
+
             t0 = time.perf_counter()
             pipeline.fit(X_train, y_train)
             train_sec = time.perf_counter() - t0
@@ -137,7 +153,7 @@ def run_target(df: pd.DataFrame, eval_df: pd.DataFrame | None, target: str, outp
         print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
     store = ResultStore()
-    run_models(X_train, y_train, X_test, y_test, store, target_dir)
+    run_models(X_train, y_train, X_test, y_test, store, target_dir, cv=args.cv, seed=args.seed)
     if store.records:
         generate_comparison_report(store, target_dir, target)
 
