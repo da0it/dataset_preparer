@@ -1,0 +1,566 @@
+{
+  "timestamp": "2026-03-30T20:00:23",
+  "target": "call_purpose",
+  "models": [
+    {
+      "model": "BoW + LogReg",
+      "group": "baseline",
+      "f1_weighted": 0.6885,
+      "precision": 0.6992,
+      "recall": 0.6914,
+      "train_sec": 6.6,
+      "infer_ms_per_sample": 0.115,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.625,
+          "recall": 0.625,
+          "f1-score": 0.625,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.75,
+          "recall": 0.9,
+          "f1-score": 0.8181818181818182,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.8333333333333334,
+          "recall": 0.5882352941176471,
+          "f1-score": 0.6896551724137931,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.6,
+          "recall": 0.6666666666666666,
+          "f1-score": 0.631578947368421,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.6666666666666666,
+          "recall": 0.6,
+          "f1-score": 0.631578947368421,
+          "support": 10.0
+        },
+        "accuracy": 0.691358024691358,
+        "macro avg": {
+          "precision": 0.6950000000000001,
+          "recall": 0.6759803921568628,
+          "f1-score": 0.6791989770664907,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.6991769547325103,
+          "recall": 0.691358024691358,
+          "f1-score": 0.6885430224813165,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "BoW + SVM",
+      "group": "baseline",
+      "f1_weighted": 0.7277,
+      "precision": 0.7446,
+      "recall": 0.7284,
+      "train_sec": 0.1,
+      "infer_ms_per_sample": 0.145,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.6923076923076923,
+          "recall": 0.5625,
+          "f1-score": 0.6206896551724138,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.782608695652174,
+          "recall": 0.9,
+          "f1-score": 0.8372093023255814,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9166666666666666,
+          "recall": 0.6470588235294118,
+          "f1-score": 0.7586206896551724,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.5454545454545454,
+          "recall": 0.6666666666666666,
+          "f1-score": 0.6,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7283950617283951,
+        "macro avg": {
+          "precision": 0.7510438836525793,
+          "recall": 0.7352450980392156,
+          "f1-score": 0.7347325008592049,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.7445979052259245,
+          "recall": 0.7283950617283951,
+          "f1-score": 0.7276938373436636,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "BoW + NaiveBayes",
+      "group": "baseline",
+      "f1_weighted": 0.7617,
+      "precision": 0.7744,
+      "recall": 0.7654,
+      "train_sec": 0.0,
+      "infer_ms_per_sample": 0.075,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.9090909090909091,
+          "recall": 0.625,
+          "f1-score": 0.7407407407407407,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.7916666666666666,
+          "recall": 0.95,
+          "f1-score": 0.8636363636363636,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.7333333333333333,
+          "recall": 0.6470588235294118,
+          "f1-score": 0.6875,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.65,
+          "recall": 0.7222222222222222,
+          "f1-score": 0.6842105263157895,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7654320987654321,
+        "macro avg": {
+          "precision": 0.7804545454545455,
+          "recall": 0.7688562091503268,
+          "f1-score": 0.7666460975671502,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.7744107744107744,
+          "recall": 0.7654320987654321,
+          "f1-score": 0.7617197181443446,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "BoW + RandomForest",
+      "group": "baseline",
+      "f1_weighted": 0.7272,
+      "precision": 0.7679,
+      "recall": 0.7407,
+      "train_sec": 0.3,
+      "infer_ms_per_sample": 0.491,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.7333333333333333,
+          "recall": 0.6875,
+          "f1-score": 0.7096774193548387,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.625,
+          "recall": 1.0,
+          "f1-score": 0.7692307692307693,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9285714285714286,
+          "recall": 0.7647058823529411,
+          "f1-score": 0.8387096774193549,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7777777777777778,
+          "recall": 0.3888888888888889,
+          "f1-score": 0.5185185185185185,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7407407407407407,
+        "macro avg": {
+          "precision": 0.7765728715728717,
+          "recall": 0.7482189542483659,
+          "f1-score": 0.7386558483332678,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.767911923467479,
+          "recall": 0.7407407407407407,
+          "f1-score": 0.7271886483356016,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "TF-IDF + LogReg",
+      "group": "baseline",
+      "f1_weighted": 0.7841,
+      "precision": 0.799,
+      "recall": 0.7901,
+      "train_sec": 0.8,
+      "infer_ms_per_sample": 0.3,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.7692307692307693,
+          "recall": 0.625,
+          "f1-score": 0.6896551724137931,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.7692307692307693,
+          "recall": 1.0,
+          "f1-score": 0.8695652173913043,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9166666666666666,
+          "recall": 0.6470588235294118,
+          "f1-score": 0.7586206896551724,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7368421052631579,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.7567567567567568,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7901234567901234,
+        "macro avg": {
+          "precision": 0.8020304257146362,
+          "recall": 0.7899673202614379,
+          "f1-score": 0.7863481386719768,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.7990199642246425,
+          "recall": 0.7901234567901234,
+          "f1-score": 0.7841406052300605,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "TF-IDF + SVM",
+      "group": "baseline",
+      "f1_weighted": 0.7841,
+      "precision": 0.799,
+      "recall": 0.7901,
+      "train_sec": 0.1,
+      "infer_ms_per_sample": 0.145,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.7692307692307693,
+          "recall": 0.625,
+          "f1-score": 0.6896551724137931,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.7692307692307693,
+          "recall": 1.0,
+          "f1-score": 0.8695652173913043,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9166666666666666,
+          "recall": 0.6470588235294118,
+          "f1-score": 0.7586206896551724,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7368421052631579,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.7567567567567568,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7901234567901234,
+        "macro avg": {
+          "precision": 0.8020304257146362,
+          "recall": 0.7899673202614379,
+          "f1-score": 0.7863481386719768,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.7990199642246425,
+          "recall": 0.7901234567901234,
+          "f1-score": 0.7841406052300605,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "TF-IDF + NaiveBayes",
+      "group": "baseline",
+      "f1_weighted": 0.795,
+      "precision": 0.8095,
+      "recall": 0.8025,
+      "train_sec": 0.1,
+      "infer_ms_per_sample": 0.135,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.8181818181818182,
+          "recall": 0.5625,
+          "f1-score": 0.6666666666666666,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.8,
+          "recall": 1.0,
+          "f1-score": 0.8888888888888888,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9285714285714286,
+          "recall": 0.7647058823529411,
+          "f1-score": 0.8387096774193549,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7222222222222222,
+          "recall": 0.7222222222222222,
+          "f1-score": 0.7222222222222222,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.7692307692307693,
+          "recall": 1.0,
+          "f1-score": 0.8695652173913043,
+          "support": 10.0
+        },
+        "accuracy": 0.8024691358024691,
+        "macro avg": {
+          "precision": 0.8076412476412477,
+          "recall": 0.8098856209150327,
+          "f1-score": 0.7972105345176874,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8094929761596428,
+          "recall": 0.8024691358024691,
+          "f1-score": 0.7950390263516853,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "TF-IDF + RandomForest",
+      "group": "baseline",
+      "f1_weighted": 0.7112,
+      "precision": 0.8118,
+      "recall": 0.716,
+      "train_sec": 0.3,
+      "infer_ms_per_sample": 0.479,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.8461538461538461,
+          "recall": 0.6875,
+          "f1-score": 0.7586206896551724,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.5263157894736842,
+          "recall": 1.0,
+          "f1-score": 0.6896551724137931,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9230769230769231,
+          "recall": 0.7058823529411765,
+          "f1-score": 0.8,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 1.0,
+          "recall": 0.3888888888888889,
+          "f1-score": 0.56,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8,
+          "recall": 0.8,
+          "f1-score": 0.8,
+          "support": 10.0
+        },
+        "accuracy": 0.7160493827160493,
+        "macro avg": {
+          "precision": 0.8191093117408906,
+          "recall": 0.7164542483660131,
+          "f1-score": 0.7216551724137931,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8118158644474434,
+          "recall": 0.7160493827160493,
+          "f1-score": 0.7112473392933164,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "N-gram(1-3) + SVM",
+      "group": "baseline",
+      "f1_weighted": 0.7703,
+      "precision": 0.7904,
+      "recall": 0.7778,
+      "train_sec": 0.2,
+      "infer_ms_per_sample": 0.197,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.7692307692307693,
+          "recall": 0.625,
+          "f1-score": 0.6896551724137931,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.7407407407407407,
+          "recall": 1.0,
+          "f1-score": 0.851063829787234,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9090909090909091,
+          "recall": 0.5882352941176471,
+          "f1-score": 0.7142857142857143,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7368421052631579,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.7567567567567568,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.7777777777777778,
+        "macro avg": {
+          "precision": 0.7948172685014792,
+          "recall": 0.778202614379085,
+          "f1-score": 0.7737808660772711,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.7903954154766372,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.7702674900033668,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "N-gram(1-3) + LogReg",
+      "group": "baseline",
+      "f1_weighted": 0.8002,
+      "precision": 0.8103,
+      "recall": 0.8025,
+      "train_sec": 0.9,
+      "infer_ms_per_sample": 0.337,
+      "resource": "низкие",
+      "notes": "",
+      "_report": {
+        "consulting": {
+          "precision": 0.7333333333333333,
+          "recall": 0.6875,
+          "f1-score": 0.7096774193548387,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.76,
+          "recall": 0.95,
+          "f1-score": 0.8444444444444444,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.9230769230769231,
+          "recall": 0.7058823529411765,
+          "f1-score": 0.8,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.8235294117647058,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.8,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.8181818181818182,
+          "recall": 0.9,
+          "f1-score": 0.8571428571428571,
+          "support": 10.0
+        },
+        "accuracy": 0.8024691358024691,
+        "macro avg": {
+          "precision": 0.8116242972713561,
+          "recall": 0.8042320261437907,
+          "f1-score": 0.8022529441884279,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8102591187558508,
+          "recall": 0.8024691358024691,
+          "f1-score": 0.8001871132098133,
+          "support": 81.0
+        }
+      }
+    }
+  ]
+}

@@ -77,6 +77,7 @@ from dataset_tools.dataset_variants import (
 from training_tools.legacy_baseline import build_legacy_baseline_pipelines
 from training_tools.tokenization_utils import encode_text_batch, save_inference_config
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
@@ -525,6 +526,8 @@ def run_baseline_models(
     X_train, y_train, X_test, y_test,
     store: ResultStore, output_dir: Path,
     cv: int = 0,
+    cv_only: bool = False,
+    seed: int = 42,
 ):
     """
     3.2 Базовые алгоритмы классификации.
@@ -539,17 +542,49 @@ def run_baseline_models(
         try:
             # ── Кросс-валидация (опционально) ─────────────────────────────────
             if cv >= 2:
-                from sklearn.model_selection import StratifiedKFold, cross_val_score
-                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+                from sklearn.model_selection import StratifiedKFold
+                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
                 # Объединяем train+test для CV по всему датасету
-                X_all = list(X_train) + list(X_test)
-                y_all = list(y_train) + list(y_test)
-                cv_scores = cross_val_score(
-                    pipeline, X_all, y_all,
-                    cv=skf, scoring="f1_weighted", n_jobs=-1
-                )
-                print(f"    CV {cv}-fold F1: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}  "
-                      f"(folds: {', '.join(f'{s:.3f}' for s in cv_scores)})")
+                X_all = np.array(list(X_train) + list(X_test), dtype=object)
+                y_all = np.array(list(y_train) + list(y_test), dtype=object)
+                fold_scores = []
+                oof_pred = np.empty(len(y_all), dtype=object)
+                total_train_sec = 0.0
+                total_infer_ms = 0.0
+
+                print(f"    CV {cv}-fold")
+                for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all), start=1):
+                    fold_pipeline = clone(pipeline)
+                    t0 = time.perf_counter()
+                    fold_pipeline.fit(X_all[tr_idx], y_all[tr_idx])
+                    total_train_sec += time.perf_counter() - t0
+
+                    t1 = time.perf_counter()
+                    fold_pred = fold_pipeline.predict(X_all[val_idx])
+                    total_infer_ms += (time.perf_counter() - t1) * 1000
+
+                    oof_pred[val_idx] = fold_pred
+                    fold_f1 = f1_score(y_all[val_idx], fold_pred, average="weighted", zero_division=0)
+                    fold_scores.append(fold_f1)
+                    print(f"      Фолд {fold_idx}/{cv}: F1 = {fold_f1:.3f}")
+
+                print(f"    CV F1: {np.mean(fold_scores):.3f} ± {np.std(fold_scores):.3f}  "
+                      f"(folds: {', '.join(f'{s:.3f}' for s in fold_scores)})")
+
+                if cv_only:
+                    f1 = store.record(
+                        f"{name} [CV{cv}]",
+                        "baseline",
+                        y_all.tolist(),
+                        oof_pred.tolist(),
+                        total_train_sec,
+                        total_infer_ms,
+                        notes=f"cv_only={cv}; folds={','.join(f'{s:.4f}' for s in fold_scores)}",
+                    )
+                    print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {total_train_sec:.1f}s")
+                    print(classification_report(y_all.tolist(), oof_pred.tolist(), zero_division=0))
+                    save_confusion_matrix(y_all.tolist(), oof_pred.tolist(), f"{name}_CV{cv}", output_dir)
+                    continue
 
             t0 = time.perf_counter()
             pipeline.fit(X_train, y_train)
@@ -872,6 +907,7 @@ def _finetune_transformer(
     early_stopping_metric: str = "f1",
     save_model: bool = True,
     silent: bool = False,
+    return_details: bool = False,
     seed: int = 42,
 ):
     """
@@ -1164,10 +1200,13 @@ def _finetune_transformer(
     y_pred      = le.inverse_transform(np.array(all_preds))
     y_test_orig = list(y_test)
 
-    f1 = store.record(
-        friendly_name, "transformers", y_test_orig, y_pred,
-        train_sec, infer_ms, notes=model_name,
-    ) if not silent else f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
+    if silent:
+        f1 = f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
+    else:
+        f1 = store.record(
+            friendly_name, "transformers", y_test_orig, y_pred,
+            train_sec, infer_ms, notes=model_name,
+        )
 
     history_meta = {
         "model_name": model_name,
@@ -1215,6 +1254,18 @@ def _finetune_transformer(
         save_inference_config(model_out, max_length, truncation_strategy)
         print(f"    Сохранено: {model_out.name}/")
 
+    if return_details:
+        return {
+            "f1": float(f1),
+            "y_true": list(y_test_orig),
+            "y_pred": list(y_pred),
+            "train_sec": float(train_sec),
+            "infer_ms": float(infer_ms),
+            "best_epoch": int(best_epoch),
+            "best_val_f1": float(best_f1),
+            "best_val_loss": float(best_loss),
+        }
+
     return f1
 
 
@@ -1239,6 +1290,7 @@ def run_transformer_models(
     max_length: int = 256,
     truncation_strategy: str = "head",
     cv: int = 0,
+    cv_only: bool = False,
     seed: int = 42,
 ):
     """
@@ -1293,18 +1345,31 @@ def run_transformer_models(
             y_all = np.array(list(y_train) + list(y_test))
             skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
             fold_scores = []
+            cv_y_true = []
+            cv_y_pred = []
+            cv_train_sec = 0.0
+            cv_infer_ms = 0.0
             print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
             for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
                 print(f"    — Фолд {fold_idx + 1}/{cv}  "
                       f"(train={len(tr_idx)}, val={len(val_idx)})")
-                fold_f1 = _finetune_transformer(
+                fold_result = _finetune_transformer(
                     model_name=model_id, friendly_name=f"{name} fold{fold_idx+1}",
                     X_train=X_all[tr_idx], y_train=y_all[tr_idx],
                     X_test=X_all[val_idx],  y_test=y_all[val_idx],
                     save_model=False, silent=True,
+                    return_details=cv_only,
                     **_ft_kwargs,
                 )
-                if fold_f1 is not None:
+                if fold_result is not None:
+                    if cv_only:
+                        fold_f1 = float(fold_result["f1"])
+                        cv_y_true.extend(fold_result["y_true"])
+                        cv_y_pred.extend(fold_result["y_pred"])
+                        cv_train_sec += float(fold_result["train_sec"])
+                        cv_infer_ms += float(fold_result["infer_ms"])
+                    else:
+                        fold_f1 = float(fold_result)
                     fold_scores.append(fold_f1)
                     print(f"      F1 = {fold_f1:.3f}")
             if fold_scores:
@@ -1313,6 +1378,22 @@ def run_transformer_models(
                 folds_str = ", ".join(f"{s:.3f}" for s in fold_scores)
                 print(f"    CV F1: {mean_f1:.3f} ± {std_f1:.3f}  "
                       f"(фолды: {folds_str})")
+                if cv_only and cv_y_pred:
+                    f1 = store.record(
+                        f"{name} [CV{cv}]",
+                        "transformers",
+                        cv_y_true,
+                        cv_y_pred,
+                        cv_train_sec,
+                        cv_infer_ms,
+                        notes=f"{model_id}; cv_only={cv}; folds={','.join(f'{s:.4f}' for s in fold_scores)}",
+                    )
+                    print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {cv_train_sec:.1f}s")
+                    print(classification_report(cv_y_true, cv_y_pred, zero_division=0))
+                    save_confusion_matrix(cv_y_true, cv_y_pred, f"{name}_CV{cv}", output_dir)
+
+            if cv_only:
+                continue
 
         # ── Финальное обучение на полном train-сете ───────────────────────────
         _finetune_transformer(
@@ -1475,7 +1556,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
     # ── 3.2 ──────────────────────────────────────────────────────────────────
     if run_all or "baseline" in groups:
         run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir,
-                            cv=effective_cv)
+                            cv=effective_cv, cv_only=args.cv_only, seed=args.seed)
 
     if "legacy-baseline" in groups:
         run_legacy_baseline_models(X_train, y_train, X_test, y_test, store, target_dir)
@@ -1511,6 +1592,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             max_length=args.max_length,
             truncation_strategy=args.truncation_strategy,
             cv=effective_cv,
+            cv_only=args.cv_only,
             seed=args.seed,
         )
 
@@ -1626,6 +1708,9 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--cv", type=int, default=0,
                         help="Кросс-валидация для baseline моделей: число фолдов (default: 0 = выкл). "
                              "Рекомендуется 5 для малых датасетов")
+    parser.add_argument("--cv-only", action="store_true",
+                        help="Считать и сохранять только CV-метрики без финального hold-out прогона. "
+                             "Требует --cv >= 2")
     parser.add_argument("--train-augmentation",
                         choices=["none", "oversample"],
                         default="none",
@@ -1641,10 +1726,36 @@ def main(argv: list[str] | None = None):
     
 
     args = parser.parse_args(argv)
+    requested_groups = set(g.strip() for g in args.groups.split(",") if g.strip())
 
     if args.fp16 and args.bf16:
         print("Ошибка: --fp16 и --bf16 нельзя использовать одновременно.")
         return 1
+
+    if args.cv_only and args.cv < 2:
+        print("Ошибка: --cv-only требует --cv >= 2.")
+        return 1
+
+    if args.cv_only and args.eval_input:
+        print("Ошибка: --cv-only нельзя использовать вместе с --eval-input.")
+        return 1
+
+    if args.cv_only and args.train_augmentation != "none":
+        print("Ошибка: --cv-only нельзя использовать вместе с --train-augmentation.")
+        return 1
+
+    if args.cv_only:
+        unsupported_for_cv_only = requested_groups & {
+            "legacy-baseline", "embeddings", "word2vec", "doc2vec", "fasttext",
+            "sbert", "llm", "cnn", "all",
+        }
+        if unsupported_for_cv_only:
+            bad = ", ".join(sorted(unsupported_for_cv_only))
+            print(
+                "Ошибка: --cv-only сейчас поддержан только для baseline и transformer-групп "
+                f"(rubert/xlmr/extra-models). Уберите группы: {bad}."
+            )
+            return 1
 
     print_gpu_info()
 

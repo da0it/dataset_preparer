@@ -1,0 +1,342 @@
+{
+  "timestamp": "2026-03-30T22:40:57",
+  "target": "call_purpose",
+  "models": [
+    {
+      "model": "RuBERT",
+      "group": "transformers",
+      "f1_weighted": 0.8892,
+      "precision": 0.8918,
+      "recall": 0.8889,
+      "train_sec": 129.4,
+      "infer_ms_per_sample": 3.879,
+      "resource": "высокие",
+      "notes": "DeepPavlov/rubert-base-cased",
+      "_report": {
+        "consulting": {
+          "precision": 0.875,
+          "recall": 0.875,
+          "f1-score": 0.875,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.8571428571428571,
+          "recall": 0.9,
+          "f1-score": 0.8780487804878049,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 1.0,
+          "recall": 0.8823529411764706,
+          "f1-score": 0.9375,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.8333333333333334,
+          "recall": 0.8333333333333334,
+          "f1-score": 0.8333333333333334,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1-score": 0.9523809523809523,
+          "support": 10.0
+        },
+        "accuracy": 0.8888888888888888,
+        "macro avg": {
+          "precision": 0.89491341991342,
+          "recall": 0.8981372549019607,
+          "f1-score": 0.895252613240418,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8917748917748918,
+          "recall": 0.8888888888888888,
+          "f1-score": 0.8891640139946373,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "XLM-RoBERTa",
+      "group": "transformers",
+      "f1_weighted": 0.8757,
+      "precision": 0.8808,
+      "recall": 0.8765,
+      "train_sec": 100.1,
+      "infer_ms_per_sample": 3.765,
+      "resource": "высокие",
+      "notes": "xlm-roberta-base",
+      "_report": {
+        "consulting": {
+          "precision": 0.8461538461538461,
+          "recall": 0.6875,
+          "f1-score": 0.7586206896551724,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.9047619047619048,
+          "recall": 0.95,
+          "f1-score": 0.926829268292683,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 1.0,
+          "recall": 0.9411764705882353,
+          "f1-score": 0.9696969696969697,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.7619047619047619,
+          "recall": 0.8888888888888888,
+          "f1-score": 0.8205128205128205,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.9,
+          "recall": 0.9,
+          "f1-score": 0.9,
+          "support": 10.0
+        },
+        "accuracy": 0.8765432098765432,
+        "macro avg": {
+          "precision": 0.8825641025641027,
+          "recall": 0.8735130718954249,
+          "f1-score": 0.8751319496315292,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8808393252837696,
+          "recall": 0.8765432098765432,
+          "f1-score": 0.8756616747458723,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "ruRoBERTa-large",
+      "group": "transformers",
+      "f1_weighted": 0.9254,
+      "precision": 0.9277,
+      "recall": 0.9259,
+      "train_sec": 249.0,
+      "infer_ms_per_sample": 11.241,
+      "resource": "высокие",
+      "notes": "ai-forever/ruRoberta-large",
+      "_report": {
+        "consulting": {
+          "precision": 0.8888888888888888,
+          "recall": 1.0,
+          "f1-score": 0.9411764705882353,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.9473684210526315,
+          "recall": 0.9,
+          "f1-score": 0.9230769230769231,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 1.0,
+          "recall": 0.9411764705882353,
+          "f1-score": 0.9696969696969697,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.8823529411764706,
+          "recall": 0.8333333333333334,
+          "f1-score": 0.8571428571428571,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1-score": 0.9523809523809523,
+          "support": 10.0
+        },
+        "accuracy": 0.9259259259259259,
+        "macro avg": {
+          "precision": 0.9255402320417799,
+          "recall": 0.9349019607843136,
+          "f1-score": 0.9286948345771876,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.9276895392019805,
+          "recall": 0.9259259259259259,
+          "f1-score": 0.9254023633108599,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "ruBert-base",
+      "group": "transformers",
+      "f1_weighted": 0.8777,
+      "precision": 0.8814,
+      "recall": 0.8765,
+      "train_sec": 127.1,
+      "infer_ms_per_sample": 3.753,
+      "resource": "высокие",
+      "notes": "ai-forever/ruBert-base",
+      "_report": {
+        "consulting": {
+          "precision": 0.8,
+          "recall": 0.75,
+          "f1-score": 0.7741935483870968,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.9047619047619048,
+          "recall": 0.95,
+          "f1-score": 0.926829268292683,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 1.0,
+          "recall": 0.9411764705882353,
+          "f1-score": 0.9696969696969697,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.75,
+          "recall": 0.8333333333333334,
+          "f1-score": 0.7894736842105263,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 1.0,
+          "recall": 0.9,
+          "f1-score": 0.9473684210526315,
+          "support": 10.0
+        },
+        "accuracy": 0.8765432098765432,
+        "macro avg": {
+          "precision": 0.8909523809523809,
+          "recall": 0.8749019607843138,
+          "f1-score": 0.8815123783279816,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8814226925338037,
+          "recall": 0.8765432098765432,
+          "f1-score": 0.8776881623606354,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "mDeBERTa-v3",
+      "group": "transformers",
+      "f1_weighted": 0.826,
+      "precision": 0.8264,
+      "recall": 0.8272,
+      "train_sec": 354.1,
+      "infer_ms_per_sample": 11.321,
+      "resource": "высокие",
+      "notes": "microsoft/mdeberta-v3-base",
+      "_report": {
+        "consulting": {
+          "precision": 0.7333333333333333,
+          "recall": 0.6875,
+          "f1-score": 0.7096774193548387,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.9047619047619048,
+          "recall": 0.95,
+          "f1-score": 0.926829268292683,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 0.8888888888888888,
+          "recall": 0.9411764705882353,
+          "f1-score": 0.9142857142857143,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.6666666666666666,
+          "recall": 0.6666666666666666,
+          "f1-score": 0.6666666666666666,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 1.0,
+          "recall": 0.9,
+          "f1-score": 0.9473684210526315,
+          "support": 10.0
+        },
+        "accuracy": 0.8271604938271605,
+        "macro avg": {
+          "precision": 0.8387301587301585,
+          "recall": 0.8290686274509804,
+          "f1-score": 0.8329654979305069,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.8264158338232412,
+          "recall": 0.8271604938271605,
+          "f1-score": 0.8260242645545004,
+          "support": 81.0
+        }
+      }
+    },
+    {
+      "model": "RuBERT-tiny",
+      "group": "transformers",
+      "f1_weighted": 0.89,
+      "precision": 0.901,
+      "recall": 0.8889,
+      "train_sec": 51.4,
+      "infer_ms_per_sample": 1.713,
+      "resource": "высокие",
+      "notes": "cointegrated/rubert-tiny2",
+      "_report": {
+        "consulting": {
+          "precision": 0.7368421052631579,
+          "recall": 0.875,
+          "f1-score": 0.8,
+          "support": 16.0
+        },
+        "cooperation": {
+          "precision": 0.8695652173913043,
+          "recall": 1.0,
+          "f1-score": 0.9302325581395349,
+          "support": 20.0
+        },
+        "courses": {
+          "precision": 1.0,
+          "recall": 0.8823529411764706,
+          "f1-score": 0.9375,
+          "support": 17.0
+        },
+        "license": {
+          "precision": 0.9333333333333333,
+          "recall": 0.7777777777777778,
+          "f1-score": 0.8484848484848485,
+          "support": 18.0
+        },
+        "portal_access": {
+          "precision": 1.0,
+          "recall": 0.9,
+          "f1-score": 0.9473684210526315,
+          "support": 10.0
+        },
+        "accuracy": 0.8888888888888888,
+        "macro avg": {
+          "precision": 0.9079481311975591,
+          "recall": 0.8870261437908497,
+          "f1-score": 0.892717165535403,
+          "support": 81.0
+        },
+        "weighted avg": {
+          "precision": 0.900997259654773,
+          "recall": 0.8888888888888888,
+          "f1-score": 0.8899822548894357,
+          "support": 81.0
+        }
+      }
+    }
+  ]
+}
