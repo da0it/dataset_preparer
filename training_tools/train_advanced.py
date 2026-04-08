@@ -345,6 +345,97 @@ def save_epoch_history(
     return json_path, csv_path
 
 
+def augment_training_split(
+    X_train,
+    y_train,
+    method: str,
+    target: str,
+    output_dir: Path,
+    seed: int = 42,
+):
+    """
+    Apply train-only augmentation and save an audit trail.
+
+    Current methods:
+      - none: no augmentation
+      - oversample: duplicate minority-class samples up to the majority class size
+    """
+    X_series = pd.Series(list(X_train), name="text").reset_index(drop=True)
+    y_series = pd.Series(list(y_train), name=target).reset_index(drop=True)
+
+    if method == "none":
+        return X_series, y_series, None
+
+    if method != "oversample":
+        raise ValueError(f"Unsupported train augmentation method: {method}")
+
+    train_df = pd.DataFrame({
+        "text": X_series,
+        target: y_series,
+        "_aug_source": "original",
+    })
+    before_counts = train_df[target].value_counts().sort_index()
+    max_count = int(before_counts.max())
+
+    parts = []
+    for class_name, class_df in train_df.groupby(target, sort=False):
+        parts.append(class_df)
+        deficit = max_count - len(class_df)
+        if deficit <= 0:
+            continue
+        extra = class_df.sample(
+            n=deficit,
+            replace=True,
+            random_state=seed,
+        ).copy()
+        extra["_aug_source"] = "oversample"
+        parts.append(extra)
+
+    augmented_df = (
+        pd.concat(parts, ignore_index=True)
+        .sample(frac=1.0, random_state=seed)
+        .reset_index(drop=True)
+    )
+    after_counts = augmented_df[target].value_counts().sort_index()
+
+    aug_dir = output_dir / "_augmentation"
+    aug_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = aug_dir / f"train_augmented_{target}.csv"
+    summary_path = aug_dir / f"train_augmented_{target}.json"
+    augmented_df.to_csv(csv_path, index=False, encoding="utf-8")
+
+    summary = {
+        "method": method,
+        "target": target,
+        "seed": seed,
+        "n_train_before": int(len(train_df)),
+        "n_train_after": int(len(augmented_df)),
+        "before_class_counts": {str(k): int(v) for k, v in before_counts.items()},
+        "after_class_counts": {str(k): int(v) for k, v in after_counts.items()},
+        "n_synthetic_rows": int((augmented_df["_aug_source"] != "original").sum()),
+        "csv_path": str(csv_path),
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"\n  Аугментация train: {method}")
+    print(f"  Train до : {len(train_df)}")
+    print(f"  Train после: {len(augmented_df)}")
+    print("  Классы до аугментации:")
+    for cls, cnt in before_counts.items():
+        print(f"    {cls:<35} {int(cnt):>4}")
+    print("  Классы после аугментации:")
+    for cls, cnt in after_counts.items():
+        print(f"    {cls:<35} {int(cnt):>4}")
+    print(f"  Сохранено: {csv_path}")
+
+    return (
+        augmented_df["text"].reset_index(drop=True),
+        augmented_df[target].reset_index(drop=True),
+        summary,
+    )
+
+
 # ==============================================================================
 # SECTION 3.2 — БАЗОВЫЕ АЛГОРИТМЫ КЛАССИФИКАЦИИ
 # ==============================================================================
@@ -1358,15 +1449,33 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
         )
         print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
+    augmentation_summary = None
+    if args.train_augmentation != "none":
+        X_train, y_train, augmentation_summary = augment_training_split(
+            X_train,
+            y_train,
+            method=args.train_augmentation,
+            target=target,
+            output_dir=target_dir,
+            seed=args.seed,
+        )
+
     groups = set(g.strip() for g in args.groups.split(","))
     run_all = "all" in groups
+    effective_cv = args.cv
+    if augmentation_summary is not None and effective_cv >= 2:
+        print(
+            "\n  Предупреждение: CV отключена, потому что train augmentation "
+            "дублирует строки и исказит fold-оценку."
+        )
+        effective_cv = 0
 
     store = ResultStore()
 
     # ── 3.2 ──────────────────────────────────────────────────────────────────
     if run_all or "baseline" in groups:
         run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir,
-                            cv=args.cv)
+                            cv=effective_cv)
 
     if "legacy-baseline" in groups:
         run_legacy_baseline_models(X_train, y_train, X_test, y_test, store, target_dir)
@@ -1401,7 +1510,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             extra_models=args.extra_models,
             max_length=args.max_length,
             truncation_strategy=args.truncation_strategy,
-            cv=args.cv,
+            cv=effective_cv,
             seed=args.seed,
         )
 
@@ -1517,6 +1626,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--cv", type=int, default=0,
                         help="Кросс-валидация для baseline моделей: число фолдов (default: 0 = выкл). "
                              "Рекомендуется 5 для малых датасетов")
+    parser.add_argument("--train-augmentation",
+                        choices=["none", "oversample"],
+                        default="none",
+                        help="Train-only аугментация: "
+                             "none = без аугментации; "
+                             "oversample = дублировать редкие классы до размера мажоритарного")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for split / CV / transformer fine-tuning (default: 42)")
     parser.add_argument("--extra-models", type=lambda s: s.split(","), default=None,
