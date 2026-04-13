@@ -4,7 +4,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
 
 Секция 3.2  Базовые алгоритмы ML
     Векторизаторы : Bag-of-Words (CountVectorizer), TF-IDF, N-gram TF-IDF
-    Классификаторы: Logistic Regression, SVM, Naive Bayes, Random Forest
+    Классификаторы: Logistic Regression, SVM, Naive Bayes, Random Forest, Decision Tree
 
 Секция 3.3  Нейросетевые модели
   3.3.1 Эмбеддинги : Word2Vec, Doc2Vec, fastText, SentenceTransformers (SBERT)
@@ -93,6 +93,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import ComplementNB, MultinomialNB
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import LinearSVC
 from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
@@ -444,9 +445,9 @@ def augment_training_split(
 def build_baseline_pipelines() -> dict[str, Pipeline]:
     """
     3.2.1 Векторизация: BoW, TF-IDF, N-gram TF-IDF.
-    3.2.2 Классификаторы: LogReg, SVM, NaiveBayes, RandomForest.
+    3.2.2 Классификаторы: LogReg, SVM, NaiveBayes, RandomForest, DecisionTree.
 
-    Итого 12 пайплайнов для всестороннего baseline-сравнения.
+    Итого 15 пайплайнов для всестороннего baseline-сравнения.
     """
     bow_kw    = dict(max_features=15_000, min_df=1)
     tfidf_kw  = dict(ngram_range=(1, 2), max_features=15_000,
@@ -459,6 +460,12 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
     svm_kw = dict(max_iter=3000, class_weight="balanced", C=1.0)
     rf_kw  = dict(n_estimators=200, class_weight="balanced",
                   random_state=42, n_jobs=-1)
+    dt_kw  = dict(
+        class_weight="balanced",
+        random_state=42,
+        max_depth=40,
+        min_samples_leaf=2,
+    )
 
     return {
         # ── BoW ────────────────────────────────────────────────────────────
@@ -477,6 +484,10 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
         "BoW + RandomForest": Pipeline([
             ("vec", CountVectorizer(**bow_kw)),
             ("clf", RandomForestClassifier(**rf_kw)),
+        ]),
+        "BoW + DecisionTree": Pipeline([
+            ("vec", CountVectorizer(**bow_kw)),
+            ("clf", DecisionTreeClassifier(**dt_kw)),
         ]),
         # ── TF-IDF ─────────────────────────────────────────────────────────
         "TF-IDF + LogReg": Pipeline([
@@ -503,6 +514,10 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
             ("vec", TfidfVectorizer(**tfidf_kw)),
             ("clf", RandomForestClassifier(**rf_kw)),
         ]),
+        "TF-IDF + DecisionTree": Pipeline([
+            ("vec", TfidfVectorizer(**tfidf_kw)),
+            ("clf", DecisionTreeClassifier(**dt_kw)),
+        ]),
         # ── N-gram TF-IDF ──────────────────────────────────────────────────
         "N-gram(1-3) + SVM": Pipeline([
             ("vec", TfidfVectorizer(**ngram_kw)),
@@ -518,6 +533,10 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
         "N-gram(1-3) + LogReg": Pipeline([
             ("vec", TfidfVectorizer(**ngram_kw)),
             ("clf", LogisticRegression(**lr_kw)),
+        ]),
+        "N-gram(1-3) + DecisionTree": Pipeline([
+            ("vec", TfidfVectorizer(**ngram_kw)),
+            ("clf", DecisionTreeClassifier(**dt_kw)),
         ]),
     }
 
@@ -1613,7 +1632,7 @@ def main(argv: list[str] | None = None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Группы моделей (--groups):
-  baseline     — BoW/TF-IDF + LogReg/SVM/NB/RF
+  baseline     — BoW/TF-IDF/N-gram + LogReg/SVM/NB/RF/DecisionTree
   legacy-baseline — старый набор моделей из train.py
   embeddings   — Word2Vec, Doc2Vec, fastText, SBERT
   rubert       — RuBERT fine-tuning (требует transformers + torch)
