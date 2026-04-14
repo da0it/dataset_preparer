@@ -11,6 +11,43 @@ from typing import Iterable
 INFERENCE_CONFIG_NAME = "inference_config.json"
 
 
+def load_hf_tokenizer(model_ref: str):
+    """Load a tokenizer with conservative fallbacks for diverse HF architectures."""
+    from transformers import AutoTokenizer
+
+    tokenizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
+    except TypeError as exc:
+        msg = str(exc)
+        if "fix_mistral_regex" not in msg:
+            if "BertPreTokenizer" in msg or "pre_tokenizer" in msg:
+                tokenizer = AutoTokenizer.from_pretrained(model_ref, use_fast=False)
+            else:
+                raise
+
+    if tokenizer is None:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_ref)
+        except TypeError as exc:
+            msg = str(exc)
+            if "BertPreTokenizer" in msg or "pre_tokenizer" in msg:
+                tokenizer = AutoTokenizer.from_pretrained(model_ref, use_fast=False)
+            else:
+                raise
+
+    if tokenizer.pad_token is None:
+        fallback_token = (
+            tokenizer.eos_token
+            or tokenizer.sep_token
+            or tokenizer.cls_token
+        )
+        if fallback_token is not None:
+            tokenizer.pad_token = fallback_token
+
+    return tokenizer
+
+
 def normalize_truncation_strategy(strategy: str) -> str:
     normalized = strategy.strip().lower().replace("-", "_")
     if normalized == "middle_cut":

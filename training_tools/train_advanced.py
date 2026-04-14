@@ -75,7 +75,11 @@ from dataset_tools.dataset_variants import (
     save_prepared_dataset,
 )
 from training_tools.legacy_baseline import build_legacy_baseline_pipelines
-from training_tools.tokenization_utils import encode_text_batch, save_inference_config
+from training_tools.tokenization_utils import (
+    encode_text_batch,
+    load_hf_tokenizer,
+    save_inference_config,
+)
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
@@ -957,7 +961,7 @@ def _finetune_transformer(
     set_global_seed(seed)
 
     def _load_tokenizer(model_ref: str):
-        return AutoTokenizer.from_pretrained(model_ref)
+        return load_hf_tokenizer(model_ref)
 
     print(f"\n  [{friendly_name}]  модель: {model_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1028,6 +1032,9 @@ def _finetune_transformer(
         print(f"\n  [{friendly_name}]  ПРОПУСК — не удалось загрузить модель: {e}")
         print(f"    Проверьте правильность model id: {model_name}")
         return
+
+    if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     # ── Layer freezing (техника для малых датасетов) ──────────────────────────
     if freeze_layers > 0:

@@ -56,7 +56,11 @@ from scipy.special import softmax
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import label_binarize
-from training_tools.tokenization_utils import encode_text_batch, resolve_inference_config
+from training_tools.tokenization_utils import (
+    encode_text_batch,
+    load_hf_tokenizer,
+    resolve_inference_config,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -279,12 +283,11 @@ def load_model_and_tokenizer(model_dir: Path):
     if not le_path.exists():
         raise FileNotFoundError(f"label_encoder.joblib не найден в {model_dir}")
 
-    def _load_tokenizer(model_ref: str):
-        return AutoTokenizer.from_pretrained(model_ref)
-
     le        = joblib.load(le_path)
-    tokenizer = _load_tokenizer(str(model_dir))
+    tokenizer = load_hf_tokenizer(str(model_dir))
     model     = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
+    if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = model.to(device)

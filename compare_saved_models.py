@@ -16,7 +16,11 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 from training_tools.ensemble_experiments import hard_vote, max_vote, soft_vote
-from training_tools.tokenization_utils import encode_text_batch, resolve_inference_config
+from training_tools.tokenization_utils import (
+    encode_text_batch,
+    load_hf_tokenizer,
+    resolve_inference_config,
+)
 
 
 @dataclass
@@ -148,24 +152,7 @@ def _softmax_nd(arr: np.ndarray) -> np.ndarray:
 
 
 def _load_tokenizer(model_ref: str):
-    from transformers import AutoTokenizer
-
-    try:
-        return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True)
-    except TypeError as exc:
-        msg = str(exc)
-        if "fix_mistral_regex" not in msg:
-            if "BertPreTokenizer" in msg or "pre_tokenizer" in msg:
-                return AutoTokenizer.from_pretrained(model_ref, use_fast=False)
-            raise
-
-    try:
-        return AutoTokenizer.from_pretrained(model_ref)
-    except TypeError as exc:
-        msg = str(exc)
-        if "BertPreTokenizer" in msg or "pre_tokenizer" in msg:
-            return AutoTokenizer.from_pretrained(model_ref, use_fast=False)
-        raise
+    return load_hf_tokenizer(model_ref)
 
 
 def discover_transformers(root: Path, target: str) -> list[ModelSpec]:
@@ -268,6 +255,8 @@ def evaluate_transformer(
     le = joblib.load(le_path)
     tokenizer = _load_tokenizer(str(spec.path))
     model = AutoModelForSequenceClassification.from_pretrained(str(spec.path))
+    if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
     n_params = int(sum(p.numel() for p in model.parameters()))
     effective_max_length, effective_truncation_strategy = resolve_inference_config(
         spec.path, max_length, truncation_strategy
