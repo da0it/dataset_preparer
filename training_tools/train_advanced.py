@@ -1363,72 +1363,82 @@ def run_transformer_models(
     )
 
     for model_id, name in models:
-
-        # ── Кросс-валидация ───────────────────────────────────────────────────
-        if cv >= 2:
-            from sklearn.model_selection import StratifiedKFold
-            X_all = np.array(list(X_train) + list(X_test))
-            y_all = np.array(list(y_train) + list(y_test))
-            skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
-            fold_scores = []
-            cv_y_true = []
-            cv_y_pred = []
-            cv_train_sec = 0.0
-            cv_infer_ms = 0.0
-            print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
-            for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
-                print(f"    — Фолд {fold_idx + 1}/{cv}  "
-                      f"(train={len(tr_idx)}, val={len(val_idx)})")
-                fold_result = _finetune_transformer(
-                    model_name=model_id, friendly_name=f"{name} fold{fold_idx+1}",
-                    X_train=X_all[tr_idx], y_train=y_all[tr_idx],
-                    X_test=X_all[val_idx],  y_test=y_all[val_idx],
-                    save_model=False, silent=True,
-                    return_details=cv_only,
-                    **_ft_kwargs,
-                )
-                if fold_result is not None:
-                    if cv_only:
-                        fold_f1 = float(fold_result["f1"])
-                        cv_y_true.extend(fold_result["y_true"])
-                        cv_y_pred.extend(fold_result["y_pred"])
-                        cv_train_sec += float(fold_result["train_sec"])
-                        cv_infer_ms += float(fold_result["infer_ms"])
-                    else:
-                        fold_f1 = float(fold_result)
-                    fold_scores.append(fold_f1)
-                    print(f"      F1 = {fold_f1:.3f}")
-            if fold_scores:
-                mean_f1 = np.mean(fold_scores)
-                std_f1  = np.std(fold_scores)
-                folds_str = ", ".join(f"{s:.3f}" for s in fold_scores)
-                print(f"    CV F1: {mean_f1:.3f} ± {std_f1:.3f}  "
-                      f"(фолды: {folds_str})")
-                if cv_only and cv_y_pred:
-                    f1 = store.record(
-                        f"{name} [CV{cv}]",
-                        "transformers",
-                        cv_y_true,
-                        cv_y_pred,
-                        cv_train_sec,
-                        cv_infer_ms,
-                        notes=f"{model_id}; cv_only={cv}; folds={','.join(f'{s:.4f}' for s in fold_scores)}",
+        try:
+            # ── Кросс-валидация ───────────────────────────────────────────────
+            if cv >= 2:
+                from sklearn.model_selection import StratifiedKFold
+                X_all = np.array(list(X_train) + list(X_test))
+                y_all = np.array(list(y_train) + list(y_test))
+                skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+                fold_scores = []
+                cv_y_true = []
+                cv_y_pred = []
+                cv_train_sec = 0.0
+                cv_infer_ms = 0.0
+                print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
+                for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
+                    print(f"    — Фолд {fold_idx + 1}/{cv}  "
+                          f"(train={len(tr_idx)}, val={len(val_idx)})")
+                    fold_result = _finetune_transformer(
+                        model_name=model_id, friendly_name=f"{name} fold{fold_idx+1}",
+                        X_train=X_all[tr_idx], y_train=y_all[tr_idx],
+                        X_test=X_all[val_idx],  y_test=y_all[val_idx],
+                        save_model=False, silent=True,
+                        return_details=cv_only,
+                        **_ft_kwargs,
                     )
-                    print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {cv_train_sec:.1f}s")
-                    print(classification_report(cv_y_true, cv_y_pred, zero_division=0))
-                    save_confusion_matrix(cv_y_true, cv_y_pred, f"{name}_CV{cv}", output_dir)
+                    if fold_result is not None:
+                        if cv_only:
+                            fold_f1 = float(fold_result["f1"])
+                            cv_y_true.extend(fold_result["y_true"])
+                            cv_y_pred.extend(fold_result["y_pred"])
+                            cv_train_sec += float(fold_result["train_sec"])
+                            cv_infer_ms += float(fold_result["infer_ms"])
+                        else:
+                            fold_f1 = float(fold_result)
+                        fold_scores.append(fold_f1)
+                        print(f"      F1 = {fold_f1:.3f}")
+                if fold_scores:
+                    mean_f1 = np.mean(fold_scores)
+                    std_f1  = np.std(fold_scores)
+                    folds_str = ", ".join(f"{s:.3f}" for s in fold_scores)
+                    print(f"    CV F1: {mean_f1:.3f} ± {std_f1:.3f}  "
+                          f"(фолды: {folds_str})")
+                    if cv_only and cv_y_pred:
+                        f1 = store.record(
+                            f"{name} [CV{cv}]",
+                            "transformers",
+                            cv_y_true,
+                            cv_y_pred,
+                            cv_train_sec,
+                            cv_infer_ms,
+                            notes=f"{model_id}; cv_only={cv}; folds={','.join(f'{s:.4f}' for s in fold_scores)}",
+                        )
+                        print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {cv_train_sec:.1f}s")
+                        print(classification_report(cv_y_true, cv_y_pred, zero_division=0))
+                        save_confusion_matrix(cv_y_true, cv_y_pred, f"{name}_CV{cv}", output_dir)
 
-            if cv_only:
-                continue
+                if cv_only:
+                    continue
 
-        # ── Финальное обучение на полном train-сете ───────────────────────────
-        _finetune_transformer(
-            model_name=model_id, friendly_name=name,
-            X_train=X_train, y_train=y_train,
-            X_test=X_test, y_test=y_test,
-            save_model=True, silent=False,
-            **_ft_kwargs,
-        )
+            # ── Финальное обучение на полном train-сете ───────────────────────
+            _finetune_transformer(
+                model_name=model_id, friendly_name=name,
+                X_train=X_train, y_train=y_train,
+                X_test=X_test, y_test=y_test,
+                save_model=True, silent=False,
+                **_ft_kwargs,
+            )
+        except Exception as exc:
+            print(f"\n  [{name}]  ОШИБКА/ПРОПУСК — {exc}")
+            try:
+                import gc
+                import torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 # ==============================================================================
@@ -1596,7 +1606,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
         )
 
     # ── 3.3.2 ─────────────────────────────────────────────────────────────────
-    transformer_groups = {"transformers", "rubert", "xlmr"}
+    transformer_groups = {"transformers", "rubert", "xlmr", "extra-models"}
     if run_all or groups & transformer_groups:
         run_transformer_models(
             X_train, y_train, X_test, y_test, store, target_dir,
@@ -1645,6 +1655,7 @@ def main(argv: list[str] | None = None):
   rubert       — RuBERT fine-tuning (требует transformers + torch)
   xlmr         — XLM-RoBERTa fine-tuning
   transformers — rubert + xlmr вместе
+  extra-models — только модели из --extra-models
   cnn          — 7 CNN/RNN архитектур: TextCNN, StackedCNN, DPCNN,
                   CNN-BiLSTM, BiLSTM, BiGRU, BiLSTM+Attention (требует tensorflow)
   llm          — zero-shot + few-shot через OpenAI-совместимый API
