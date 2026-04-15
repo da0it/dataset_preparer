@@ -1221,7 +1221,7 @@ def _finetune_transformer(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
                 out = model(**enc)
-            probs = torch.softmax(out.logits, dim=1).cpu().numpy()
+            probs = torch.softmax(out.logits, dim=1).float().cpu().numpy()
             all_probs.append(probs)
             all_preds.extend(np.argmax(probs, axis=1).tolist())
     infer_ms = (time.perf_counter() - t1) * 1000
