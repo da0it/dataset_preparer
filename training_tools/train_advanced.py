@@ -51,6 +51,7 @@ train_advanced.py — Полный пайплайн ML/DL классификац
 
 import argparse
 import contextlib
+import hashlib
 import json
 import random
 import re
@@ -178,6 +179,102 @@ def prepare_dataset(df: pd.DataFrame, target: str, dataset_variant: str) -> pd.D
     return prepare_multiclass_frame(
         df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
     )
+
+
+def _cv_row_hashes(X_full, y_full) -> list[str]:
+    hashes = []
+    for text, label in zip(X_full, y_full):
+        payload = f"{label}\x1f{text}".encode("utf-8", errors="ignore")
+        hashes.append(hashlib.sha1(payload).hexdigest())
+    return hashes
+
+
+def resolve_cv_folds(
+    X_full,
+    y_full,
+    cv: int,
+    seed: int,
+    output_dir: Path,
+    manifest_path: Optional[Path] = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], Path, bool]:
+    from sklearn.model_selection import StratifiedKFold
+
+    if cv < 2:
+        raise ValueError("resolve_cv_folds requires cv >= 2")
+
+    X_list = list(X_full)
+    y_list = list(y_full)
+    if len(X_list) != len(y_list):
+        raise ValueError("X_full and y_full must have the same length for CV.")
+
+    resolved_path = Path(manifest_path).resolve() if manifest_path else (output_dir / f"fold_manifest_cv{cv}.json")
+    current_hashes = _cv_row_hashes(X_list, y_list)
+    current_labels = sorted(set(y_list))
+
+    if resolved_path.exists():
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        manifest_cv = int(payload.get("cv", 0))
+        manifest_rows = int(payload.get("n_samples", -1))
+        manifest_hashes = payload.get("row_hashes")
+        manifest_labels = payload.get("labels", [])
+        if manifest_cv != cv:
+            raise ValueError(
+                f"Fold manifest '{resolved_path}' was built for cv={manifest_cv}, not cv={cv}."
+            )
+        if manifest_rows != len(X_list):
+            raise ValueError(
+                f"Fold manifest '{resolved_path}' expects {manifest_rows} rows, "
+                f"but current dataset has {len(X_list)} rows."
+            )
+        if manifest_hashes and manifest_hashes != current_hashes:
+            raise ValueError(
+                f"Fold manifest '{resolved_path}' does not match the current prepared dataset."
+            )
+        if manifest_labels and sorted(manifest_labels) != current_labels:
+            raise ValueError(
+                f"Fold manifest '{resolved_path}' has a different label set than the current dataset."
+            )
+
+        folds = [
+            (
+                np.asarray(fold["train_indices"], dtype=int),
+                np.asarray(fold["val_indices"], dtype=int),
+            )
+            for fold in payload.get("folds", [])
+        ]
+        if len(folds) != cv:
+            raise ValueError(
+                f"Fold manifest '{resolved_path}' contains {len(folds)} folds, expected {cv}."
+            )
+        return folds, resolved_path, True
+
+    y_arr = np.asarray(y_list, dtype=object)
+    skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+    folds = [
+        (train_idx.astype(int), val_idx.astype(int))
+        for train_idx, val_idx in skf.split(np.zeros(len(y_arr)), y_arr)
+    ]
+    payload = {
+        "cv": cv,
+        "seed": seed,
+        "n_samples": len(X_list),
+        "labels": current_labels,
+        "row_hashes": current_hashes,
+        "folds": [
+            {
+                "fold": fold_idx + 1,
+                "train_indices": train_idx.tolist(),
+                "val_indices": val_idx.tolist(),
+            }
+            for fold_idx, (train_idx, val_idx) in enumerate(folds)
+        ],
+    }
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(resolved_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return folds, resolved_path, False
 
 
 # ==============================================================================
@@ -551,6 +648,9 @@ def run_baseline_models(
     cv: int = 0,
     cv_only: bool = False,
     seed: int = 42,
+    X_full=None,
+    y_full=None,
+    cv_manifest_path: Optional[Path] = None,
 ):
     """
     3.2 Базовые алгоритмы классификации.
@@ -565,18 +665,33 @@ def run_baseline_models(
         try:
             # ── Кросс-валидация (опционально) ─────────────────────────────────
             if cv >= 2:
-                from sklearn.model_selection import StratifiedKFold
-                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
-                # Объединяем train+test для CV по всему датасету
-                X_all = np.array(list(X_train) + list(X_test), dtype=object)
-                y_all = np.array(list(y_train) + list(y_test), dtype=object)
+                X_all = np.array(
+                    list(X_full) if X_full is not None else list(X_train) + list(X_test),
+                    dtype=object,
+                )
+                y_all = np.array(
+                    list(y_full) if y_full is not None else list(y_train) + list(y_test),
+                    dtype=object,
+                )
+                folds, resolved_manifest_path, manifest_loaded = resolve_cv_folds(
+                    X_all,
+                    y_all,
+                    cv=cv,
+                    seed=seed,
+                    output_dir=output_dir,
+                    manifest_path=cv_manifest_path,
+                )
                 fold_scores = []
                 oof_pred = np.empty(len(y_all), dtype=object)
                 total_train_sec = 0.0
                 total_infer_ms = 0.0
 
                 print(f"    CV {cv}-fold")
-                for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all), start=1):
+                print(
+                    f"    Fold manifest: {resolved_manifest_path} "
+                    f"({'loaded' if manifest_loaded else 'saved'})"
+                )
+                for fold_idx, (tr_idx, val_idx) in enumerate(folds, start=1):
                     fold_pipeline = clone(pipeline)
                     t0 = time.perf_counter()
                     fold_pipeline.fit(X_all[tr_idx], y_all[tr_idx])
@@ -1324,6 +1439,9 @@ def run_transformer_models(
     cv: int = 0,
     cv_only: bool = False,
     seed: int = 42,
+    X_full=None,
+    y_full=None,
+    cv_manifest_path: Optional[Path] = None,
 ):
     """
     3.3.2 Модели на основе трансформеров.
@@ -1372,17 +1490,27 @@ def run_transformer_models(
         try:
             # ── Кросс-валидация ───────────────────────────────────────────────
             if cv >= 2:
-                from sklearn.model_selection import StratifiedKFold
-                X_all = np.array(list(X_train) + list(X_test))
-                y_all = np.array(list(y_train) + list(y_test))
-                skf   = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+                X_all = np.array(list(X_full) if X_full is not None else list(X_train) + list(X_test))
+                y_all = np.array(list(y_full) if y_full is not None else list(y_train) + list(y_test))
+                folds, resolved_manifest_path, manifest_loaded = resolve_cv_folds(
+                    X_all,
+                    y_all,
+                    cv=cv,
+                    seed=seed,
+                    output_dir=output_dir,
+                    manifest_path=cv_manifest_path,
+                )
                 fold_scores = []
                 cv_y_true = []
                 cv_y_pred = []
                 cv_train_sec = 0.0
                 cv_infer_ms = 0.0
                 print(f"\n  [{name}]  CV {cv}-fold  (модель: {model_id})")
-                for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
+                print(
+                    f"    Fold manifest: {resolved_manifest_path} "
+                    f"({'loaded' if manifest_loaded else 'saved'})"
+                )
+                for fold_idx, (tr_idx, val_idx) in enumerate(folds):
                     print(f"    — Фолд {fold_idx + 1}/{cv}  "
                           f"(train={len(tr_idx)}, val={len(val_idx)})")
                     fold_result = _finetune_transformer(
@@ -1586,6 +1714,7 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
     groups = set(g.strip() for g in args.groups.split(","))
     run_all = "all" in groups
     effective_cv = args.cv
+    cv_manifest_path = Path(args.fold_manifest).resolve() if args.fold_manifest else None
     if augmentation_summary is not None and effective_cv >= 2:
         print(
             "\n  Предупреждение: CV отключена, потому что train augmentation "
@@ -1598,7 +1727,8 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
     # ── 3.2 ──────────────────────────────────────────────────────────────────
     if run_all or "baseline" in groups:
         run_baseline_models(X_train, y_train, X_test, y_test, store, target_dir,
-                            cv=effective_cv, cv_only=args.cv_only, seed=args.seed)
+                            cv=effective_cv, cv_only=args.cv_only, seed=args.seed,
+                            X_full=X, y_full=y, cv_manifest_path=cv_manifest_path)
 
     if "legacy-baseline" in groups:
         run_legacy_baseline_models(X_train, y_train, X_test, y_test, store, target_dir)
@@ -1636,6 +1766,9 @@ def run_target(df: pd.DataFrame, target: str, output_dir: Path, args, dataset_va
             cv=effective_cv,
             cv_only=args.cv_only,
             seed=args.seed,
+            X_full=X,
+            y_full=y,
+            cv_manifest_path=cv_manifest_path,
         )
 
     # ── 3.4 ──────────────────────────────────────────────────────────────────
@@ -1754,6 +1887,10 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--cv-only", action="store_true",
                         help="Считать и сохранять только CV-метрики без финального hold-out прогона. "
                              "Требует --cv >= 2")
+    parser.add_argument("--fold-manifest", default=None,
+                        help="Опциональный JSON с индексами фолдов. "
+                             "Если файл уже существует, CV будет выполнена по нему; "
+                             "иначе манифест будет создан автоматически.")
     parser.add_argument("--train-augmentation",
                         choices=["none", "oversample"],
                         default="none",

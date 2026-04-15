@@ -12,13 +12,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-from sklearn.model_selection import StratifiedKFold
 
 from dataset_tools.dataset_variants import load_training_frame, save_prepared_dataset
 from training_tools.train_advanced import (
     _finetune_transformer,
-    _safe_artifact_name,
     prepare_dataset,
+    resolve_cv_folds,
     save_confusion_matrix,
 )
 
@@ -43,6 +42,8 @@ def parse_args() -> argparse.Namespace:
                         default="multiclass", help="Dataset variant.")
     parser.add_argument("--cv", type=int, default=5, help="Number of folds (default: 5).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--fold-manifest", default=None,
+                        help="Optional JSON with fold indices to reuse across runs.")
     parser.add_argument("--methods", default="soft,max,hard",
                         help="Comma-separated methods: soft,max,hard")
     parser.add_argument("--transformer-model", action="append", default=[],
@@ -158,9 +159,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Models          : {[spec.name for spec in specs]}")
     print(f"Methods         : {methods}")
 
-    skf = StratifiedKFold(n_splits=args.cv, shuffle=True, random_state=args.seed)
     n_samples = len(prepared_df)
     n_classes = len(labels)
+    folds, manifest_path, manifest_loaded = resolve_cv_folds(
+        texts,
+        labels_series,
+        cv=args.cv,
+        seed=args.seed,
+        output_dir=output_dir,
+        manifest_path=Path(args.fold_manifest).resolve() if args.fold_manifest else None,
+    )
+    print(f"Fold manifest   : {manifest_path} ({'loaded' if manifest_loaded else 'saved'})")
 
     base_pred_map = {spec.name: np.empty(n_samples, dtype=object) for spec in specs}
     base_proba_map = {spec.name: np.zeros((n_samples, n_classes), dtype=float) for spec in specs}
@@ -176,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     fold_dir = output_dir / "_fold_metrics"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(texts, labels_series), start=1):
+    for fold_idx, (tr_idx, val_idx) in enumerate(folds, start=1):
         print(f"\nFold {fold_idx}/{args.cv} (train={len(tr_idx)}, val={len(val_idx)})")
         X_train = texts.iloc[tr_idx].to_numpy(dtype=object)
         y_train = labels_series.iloc[tr_idx].to_numpy(dtype=object)
