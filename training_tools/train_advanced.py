@@ -1212,6 +1212,7 @@ def _finetune_transformer(
     # ── Inference ─────────────────────────────────────────────────────────────
     model.eval()
     all_preds = []
+    all_probs = []
     t1 = time.perf_counter()
     with torch.no_grad():
         for enc, _ in test_loader:
@@ -1220,11 +1221,14 @@ def _finetune_transformer(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
                 out = model(**enc)
-            all_preds.extend(torch.argmax(out.logits, 1).cpu().tolist())
+            probs = torch.softmax(out.logits, dim=1).cpu().numpy()
+            all_probs.append(probs)
+            all_preds.extend(np.argmax(probs, axis=1).tolist())
     infer_ms = (time.perf_counter() - t1) * 1000
 
     y_pred      = le.inverse_transform(np.array(all_preds))
     y_test_orig = list(y_test)
+    proba = np.vstack(all_probs) if all_probs else np.empty((0, num_labels), dtype=float)
 
     if silent:
         f1 = f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
@@ -1285,6 +1289,8 @@ def _finetune_transformer(
             "f1": float(f1),
             "y_true": list(y_test_orig),
             "y_pred": list(y_pred),
+            "proba": proba.tolist(),
+            "classes": list(le.classes_),
             "train_sec": float(train_sec),
             "infer_ms": float(infer_ms),
             "best_epoch": int(best_epoch),

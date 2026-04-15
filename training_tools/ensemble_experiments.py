@@ -130,16 +130,28 @@ def _softmax_nd(arr: np.ndarray) -> np.ndarray:
     return exp / exp.sum(axis=1, keepdims=True)
 
 
-def predict_sklearn_proba(model_path: Path, texts: pd.Series, labels: list[str]) -> tuple[np.ndarray, np.ndarray]:
+def predict_sklearn_proba(
+    model_path: Path,
+    texts: pd.Series,
+    labels: list[str],
+) -> tuple[np.ndarray, np.ndarray, float]:
     model = joblib.load(model_path)
     if hasattr(model, "predict_proba"):
+        import time
+
+        t0 = time.perf_counter()
         proba = model.predict_proba(texts)
+        infer_ms_total = (time.perf_counter() - t0) * 1000
         classes = list(model.classes_) if hasattr(model, "classes_") else None
         if classes is None and hasattr(model, "named_steps"):
             clf = model.named_steps.get("clf")
             classes = list(getattr(clf, "classes_", []))
     elif hasattr(model, "decision_function"):
+        import time
+
+        t0 = time.perf_counter()
         scores = model.decision_function(texts)
+        infer_ms_total = (time.perf_counter() - t0) * 1000
         if scores.ndim == 1:
             scores = np.column_stack([-scores, scores])
         proba = _softmax_nd(np.asarray(scores))
@@ -159,7 +171,7 @@ def predict_sklearn_proba(model_path: Path, texts: pd.Series, labels: list[str])
         if cls in idx_map:
             aligned[:, idx_map[cls]] = proba[:, src_idx]
     pred = np.array(labels)[aligned.argmax(axis=1)]
-    return aligned, pred
+    return aligned, pred, float(infer_ms_total)
 
 
 def predict_transformer_proba(
@@ -169,8 +181,9 @@ def predict_transformer_proba(
     batch_size: int,
     max_length: int,
     truncation_strategy: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:
     import torch
+    import time
     from transformers import AutoModelForSequenceClassification
 
     le_path = model_dir / "label_encoder.joblib"
@@ -189,6 +202,7 @@ def predict_transformer_proba(
 
     all_probs = []
     text_list = list(texts)
+    t0 = time.perf_counter()
     for start in range(0, len(text_list), batch_size):
         batch = text_list[start:start + batch_size]
         enc = encode_text_batch(
@@ -202,6 +216,7 @@ def predict_transformer_proba(
             logits = model(**enc).logits
             probs = torch.softmax(logits, dim=1).cpu().numpy()
         all_probs.append(probs)
+    infer_ms_total = (time.perf_counter() - t0) * 1000
 
     proba = np.vstack(all_probs)
     classes = list(le.classes_)
@@ -211,7 +226,7 @@ def predict_transformer_proba(
         if cls in idx_map:
             aligned[:, idx_map[cls]] = proba[:, src_idx]
     pred = np.array(labels)[aligned.argmax(axis=1)]
-    return aligned, pred
+    return aligned, pred, float(infer_ms_total)
 
 
 def collect_model_outputs(
@@ -221,15 +236,16 @@ def collect_model_outputs(
     batch_size: int,
     max_length: int,
     truncation_strategy: str,
-) -> tuple[list[str], np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[list[str], np.ndarray, dict[str, np.ndarray], dict[str, float]]:
     names = []
     probas = []
     pred_map: dict[str, np.ndarray] = {}
+    infer_ms_map: dict[str, float] = {}
     for spec in specs:
         if spec.kind == "sklearn":
-            proba, pred = predict_sklearn_proba(spec.path, texts, labels)
+            proba, pred, infer_ms_total = predict_sklearn_proba(spec.path, texts, labels)
         else:
-            proba, pred = predict_transformer_proba(
+            proba, pred, infer_ms_total = predict_transformer_proba(
                 spec.path,
                 texts,
                 labels,
@@ -240,11 +256,13 @@ def collect_model_outputs(
         names.append(spec.name)
         probas.append(proba)
         pred_map[spec.name] = pred
-    return names, np.stack(probas, axis=0), pred_map
+        infer_ms_map[spec.name] = float(infer_ms_total)
+    return names, np.stack(probas, axis=0), pred_map, infer_ms_map
 
 
 def metric_bundle(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {
+        "errors": int((y_true != y_pred).sum()),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
         "precision_weighted": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
@@ -349,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
 
     test_texts, test_y = load_eval_frame(Path(args.test_input), args.target, args.sep)
     labels = sorted(test_y.unique())
-    test_names, test_prob_stack, test_pred_map = collect_model_outputs(
+    test_names, test_prob_stack, test_pred_map, test_infer_ms_map = collect_model_outputs(
         specs, test_texts, labels, args.batch_size, args.max_length, args.truncation_strategy
     )
 
@@ -361,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for name, pred in test_pred_map.items():
         metrics = metric_bundle(test_y.to_numpy(), pred)
+        metrics["infer_ms_per_sample"] = round(float(test_infer_ms_map[name]) / max(len(test_y), 1), 3)
         results.append({"model": name, "method": "base", **metrics})
         per_sample[f"pred_{name}"] = pred
         save_confusion_matrix(
@@ -376,9 +395,15 @@ def main(argv: list[str] | None = None) -> int:
         "max": max_vote,
         "hard": hard_vote,
     }
+    total_base_infer_ms = float(sum(test_infer_ms_map.values()))
     for method in [m for m in methods if m in vote_handlers]:
+        import time
+
+        t0 = time.perf_counter()
         ensemble_proba, ensemble_pred = vote_handlers[method](test_prob_stack, labels)
+        combine_ms = (time.perf_counter() - t0) * 1000
         metrics = metric_bundle(test_y.to_numpy(), ensemble_pred)
+        metrics["infer_ms_per_sample"] = round((total_base_infer_ms + combine_ms) / max(len(test_y), 1), 3)
         results.append({"model": f"Ensemble ({method})", "method": method, **metrics})
         per_sample[f"pred_ensemble_{method}"] = ensemble_pred
         per_sample[f"conf_ensemble_{method}"] = ensemble_proba.max(axis=1)
@@ -394,18 +419,23 @@ def main(argv: list[str] | None = None) -> int:
         if not args.meta_input:
             raise ValueError("Stacking requires --meta-input.")
         meta_texts, meta_y = load_eval_frame(Path(args.meta_input), args.target, args.sep)
-        _, meta_prob_stack, _ = collect_model_outputs(
+        _, meta_prob_stack, _, _ = collect_model_outputs(
             specs, meta_texts, labels, args.batch_size, args.max_length, args.truncation_strategy
         )
         X_meta_train = flatten_meta_features(meta_prob_stack)
         X_meta_test = flatten_meta_features(test_prob_stack)
         stacker = fit_stacker(X_meta_train, meta_y.to_numpy(), args.stacker)
+        import time
+
+        t0 = time.perf_counter()
         stack_pred = stacker.predict(X_meta_test)
         if hasattr(stacker, "predict_proba"):
             stack_conf = stacker.predict_proba(X_meta_test).max(axis=1)
         else:
             stack_conf = np.full(len(stack_pred), np.nan)
+        stack_ms = (time.perf_counter() - t0) * 1000
         metrics = metric_bundle(test_y.to_numpy(), stack_pred)
+        metrics["infer_ms_per_sample"] = round((total_base_infer_ms + stack_ms) / max(len(test_y), 1), 3)
         results.append({"model": f"Stacking ({args.stacker})", "method": "stacking", **metrics})
         per_sample[f"pred_stacking_{args.stacker}"] = stack_pred
         per_sample[f"conf_stacking_{args.stacker}"] = stack_conf
