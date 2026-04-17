@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
                         choices=["call_purpose", "priority", "assig_group"],
                         help="Target column.")
     parser.add_argument("--sep", default=";", help="CSV separator.")
-    parser.add_argument("--dataset-variant", choices=["multiclass", "binary_spam"],
+    parser.add_argument("--dataset-variant", choices=["multiclass", "multiclass_with_spam", "binary_spam"],
                         default="multiclass", help="Dataset variant.")
     parser.add_argument("--cv", type=int, default=5, help="Number of folds (default: 5).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")

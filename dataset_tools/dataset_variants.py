@@ -33,16 +33,18 @@ def prepare_multiclass_frame(
     target: str,
     min_samples_per_class: int,
     spam_label: str = SPAM_LABEL,
+    include_spam: bool = False,
 ) -> pd.DataFrame:
     """
     Prepare the main multiclass dataset.
 
     Spam calls are removed from every target because they should not participate
-    in downstream routing/classification.
+    in downstream routing/classification by default. Set include_spam=True for
+    experiments where spam is an explicit multiclass label.
     """
     frame = df.copy()
 
-    if "call_purpose" in frame.columns:
+    if not include_spam and "call_purpose" in frame.columns:
         purpose_norm = frame["call_purpose"].astype(str).str.strip().str.lower()
         frame = frame[purpose_norm != spam_label].copy()
 

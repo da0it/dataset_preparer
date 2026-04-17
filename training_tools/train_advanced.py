@@ -177,7 +177,10 @@ def prepare_dataset(df: pd.DataFrame, target: str, dataset_variant: str) -> pd.D
             df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
         )
     return prepare_multiclass_frame(
-        df, target=target, min_samples_per_class=MIN_SAMPLES_PER_CLASS
+        df,
+        target=target,
+        min_samples_per_class=MIN_SAMPLES_PER_CLASS,
+        include_spam=dataset_variant == "multiclass_with_spam",
     )
 
 
@@ -1823,7 +1826,7 @@ def main(argv: list[str] | None = None):
                         help="Папка для моделей и отчётов (default: models_advanced)")
     parser.add_argument("--sep", default=";",
                         help="Разделитель CSV (default: ;)")
-    parser.add_argument("--dataset-variant", choices=["multiclass", "binary_spam"],
+    parser.add_argument("--dataset-variant", choices=["multiclass", "multiclass_with_spam", "binary_spam"],
                         default="multiclass",
                         help="Как интерпретировать основной --input "
                              "(default: multiclass)")
@@ -1996,7 +1999,7 @@ def main(argv: list[str] | None = None):
     else:
         multiclass_output_dir = output_dir / "multiclass" if binary_df is not None else output_dir
         for target in targets:
-            run_target(multiclass_df, target, multiclass_output_dir, args, "multiclass")
+            run_target(multiclass_df, target, multiclass_output_dir, args, args.dataset_variant)
 
         if binary_df is not None and "call_purpose" in targets:
             run_target(binary_df, "call_purpose", output_dir / "binary_spam", args, "binary_spam")
