@@ -421,6 +421,96 @@ def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
     print(f"  График сравнения: {path.name}")
 
 
+def save_pareto_chart(store: ResultStore, output_dir: Path, target: str):
+    df = store.summary_df()
+    if df.empty or "infer_ms_per_sample" not in df.columns:
+        return
+
+    df = df.copy()
+    df = df[df["infer_ms_per_sample"] > 0].sort_values(
+        ["infer_ms_per_sample", "f1_weighted"],
+        ascending=[True, False],
+    )
+    if df.empty:
+        return
+
+    COLORS = {
+        "baseline": "#4C72B0",
+        "embeddings": "#55A868",
+        "transformers": "#DD8452",
+        "llm": "#8172B2",
+        "legacy_baseline": "#4C72B0",
+    }
+    LABELS = {
+        "baseline": "Классические ML",
+        "embeddings": "Эмбеддинги",
+        "transformers": "Трансформеры",
+        "llm": "LLM",
+        "legacy_baseline": "Классические ML",
+    }
+
+    frontier_rows = []
+    best_f1 = -1.0
+    for _, row in df.iterrows():
+        f1 = float(row["f1_weighted"])
+        if f1 > best_f1 + 1e-12:
+            frontier_rows.append(row)
+            best_f1 = f1
+    frontier = pd.DataFrame(frontier_rows)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for group, group_df in df.groupby("group", sort=False):
+        ax.scatter(
+            group_df["infer_ms_per_sample"],
+            group_df["f1_weighted"],
+            s=70,
+            alpha=0.8,
+            color=COLORS.get(group, "#777777"),
+            edgecolor="black",
+            linewidth=0.3,
+            label=LABELS.get(group, group),
+            zorder=3,
+        )
+
+    if not frontier.empty:
+        ax.plot(
+            frontier["infer_ms_per_sample"],
+            frontier["f1_weighted"],
+            color="black",
+            linestyle="--",
+            marker=".",
+            linewidth=1.2,
+            label="Pareto frontier",
+            zorder=4,
+        )
+
+    label_names = set(frontier["model"].tolist()) if not frontier.empty else set()
+    label_names.update(df.loc[df["group"] == "transformers", "model"].tolist())
+    for _, row in df.iterrows():
+        if row["model"] not in label_names:
+            continue
+        ax.annotate(
+            row["model"],
+            (row["infer_ms_per_sample"], row["f1_weighted"]),
+            fontsize=8,
+            xytext=(5, 4),
+            textcoords="offset points",
+            fontweight="bold" if row["model"] in set(frontier["model"].tolist()) else "normal",
+        )
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Время инференса на 1 образец, мс (лог. шкала)")
+    ax.set_ylabel("F1-weighted")
+    ax.set_title("Компромисс качества и скорости инференса")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.35)
+    ax.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    path = output_dir / f"pareto_{target}.png"
+    plt.savefig(path, dpi=140)
+    plt.close()
+    print(f"  Pareto-график   : {path.name}")
+
+
 def _safe_artifact_name(name: str) -> str:
     return (
         name.replace(" ", "_")
@@ -600,10 +690,6 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
         ]),
         "TF-IDF + SVM": Pipeline([
             ("vec", TfidfVectorizer(**tfidf_kw)),
-            ("clf", LinearSVC(**svm_kw)),
-        ]),
-        "TF-IDF + Calibrated SVM": Pipeline([
-            ("vec", TfidfVectorizer(**tfidf_kw)),
             ("clf", CalibratedClassifierCV(
                 LinearSVC(**svm_kw),
                 cv=3,
@@ -624,10 +710,6 @@ def build_baseline_pipelines() -> dict[str, Pipeline]:
         ]),
         # ── N-gram TF-IDF ──────────────────────────────────────────────────
         "N-gram(1-3) + SVM": Pipeline([
-            ("vec", TfidfVectorizer(**ngram_kw)),
-            ("clf", LinearSVC(**svm_kw)),
-        ]),
-        "N-gram(1-3) + Calibrated SVM": Pipeline([
             ("vec", TfidfVectorizer(**ngram_kw)),
             ("clf", CalibratedClassifierCV(
                 LinearSVC(**svm_kw),
@@ -714,7 +796,7 @@ def run_baseline_models(
 
                 if cv_only:
                     f1 = store.record(
-                        f"{name} [CV{cv}]",
+                        name,
                         "baseline",
                         y_all.tolist(),
                         oof_pred.tolist(),
@@ -724,7 +806,7 @@ def run_baseline_models(
                     )
                     print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {total_train_sec:.1f}s")
                     print(classification_report(y_all.tolist(), oof_pred.tolist(), zero_division=0))
-                    save_confusion_matrix(y_all.tolist(), oof_pred.tolist(), f"{name}_CV{cv}", output_dir)
+                    save_confusion_matrix(y_all.tolist(), oof_pred.tolist(), name, output_dir)
                     continue
 
             t0 = time.perf_counter()
@@ -1543,7 +1625,7 @@ def run_transformer_models(
                           f"(фолды: {folds_str})")
                     if cv_only and cv_y_pred:
                         f1 = store.record(
-                            f"{name} [CV{cv}]",
+                            name,
                             "transformers",
                             cv_y_true,
                             cv_y_pred,
@@ -1553,7 +1635,7 @@ def run_transformer_models(
                         )
                         print(f"    CV-only F1: {f1:.3f}  |  Train(sum): {cv_train_sec:.1f}s")
                         print(classification_report(cv_y_true, cv_y_pred, zero_division=0))
-                        save_confusion_matrix(cv_y_true, cv_y_pred, f"{name}_CV{cv}", output_dir)
+                        save_confusion_matrix(cv_y_true, cv_y_pred, name, output_dir)
 
                 if cv_only:
                     continue
@@ -1621,6 +1703,7 @@ def generate_comparison_report(store: ResultStore, output_dir: Path, target: str
 
     # Chart
     save_comparison_chart(store, output_dir, target)
+    save_pareto_chart(store, output_dir, target)
 
     # Thesis-style table
     def speed_label(ms):
