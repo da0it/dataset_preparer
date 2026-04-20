@@ -362,8 +362,15 @@ def save_confusion_matrix(y_test, y_pred, model_name: str, output_dir: Path):
     plt.close()
 
 
-def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
-    df = store.summary_df()
+def save_comparison_chart(
+    store: ResultStore,
+    output_dir: Path,
+    target: str,
+    df: Optional[pd.DataFrame] = None,
+    suffix: str = "",
+    title: Optional[str] = None,
+):
+    df = store.summary_df() if df is None else df.copy()
     if df.empty:
         return
 
@@ -375,7 +382,7 @@ def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(df) * 0.5 + 2)))
-    fig.suptitle(f"Сравнение моделей — {target}", fontsize=13, fontweight="bold")
+    fig.suptitle(title or f"Сравнение моделей — {target}", fontsize=13, fontweight="bold")
 
     # ── Left: F1 bar chart ──────────────────────────────────────────────────
     ax = axes[0]
@@ -415,14 +422,21 @@ def save_comparison_chart(store: ResultStore, output_dir: Path, target: str):
     ax2.legend(handles=legend_elements, loc="lower right", fontsize=8)
 
     plt.tight_layout()
-    path = output_dir / f"comparison_{target}.png"
+    path = output_dir / f"comparison_{target}{suffix}.png"
     plt.savefig(path, dpi=110)
     plt.close()
     print(f"  График сравнения: {path.name}")
 
 
-def save_pareto_chart(store: ResultStore, output_dir: Path, target: str):
-    df = store.summary_df()
+def save_pareto_chart(
+    store: ResultStore,
+    output_dir: Path,
+    target: str,
+    df: Optional[pd.DataFrame] = None,
+    suffix: str = "",
+    title: Optional[str] = None,
+):
+    df = store.summary_df() if df is None else df.copy()
     if df.empty or "infer_ms_per_sample" not in df.columns:
         return
 
@@ -501,11 +515,11 @@ def save_pareto_chart(store: ResultStore, output_dir: Path, target: str):
     ax.set_xscale("log")
     ax.set_xlabel("Время инференса на 1 образец, мс (лог. шкала)")
     ax.set_ylabel("F1-weighted")
-    ax.set_title("Компромисс качества и скорости инференса")
+    ax.set_title(title or "Компромисс качества и скорости инференса")
     ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.35)
     ax.legend(loc="best", fontsize=8)
     plt.tight_layout()
-    path = output_dir / f"pareto_{target}.png"
+    path = output_dir / f"pareto_{target}{suffix}.png"
     plt.savefig(path, dpi=140)
     plt.close()
     print(f"  Pareto-график   : {path.name}")

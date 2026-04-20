@@ -9,9 +9,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.neural_network import MLPClassifier
 
 from dataset_tools.dataset_variants import load_training_frame, save_prepared_dataset
 from training_tools.train_advanced import (
@@ -45,7 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fold-manifest", default=None,
                         help="Optional JSON with fold indices to reuse across runs.")
     parser.add_argument("--methods", default="soft,max,hard",
-                        help="Comma-separated methods: soft,max,hard")
+                        help="Comma-separated methods: soft,max,hard,stacking")
+    parser.add_argument("--stacker", choices=["logreg", "mlp"], default="logreg",
+                        help="Meta-model for stacking (default: logreg).")
     parser.add_argument("--transformer-model", action="append", default=[],
                         help="Base model spec: Name=model_id_or_path")
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs.")
@@ -115,6 +120,38 @@ def hard_vote(prob_stack: np.ndarray, labels: list[str]) -> tuple[np.ndarray, np
     return avg_probs, np.array(labels)[final_idx]
 
 
+def flatten_meta_features(prob_maps: dict[str, np.ndarray], specs: list[ModelSpec]) -> tuple[np.ndarray, list[str]]:
+    blocks = []
+    columns = []
+    for spec in specs:
+        proba = prob_maps[spec.name]
+        blocks.append(proba)
+        for cls_idx in range(proba.shape[1]):
+            columns.append(f"prob_{spec.name}_class_{cls_idx}")
+    return np.concatenate(blocks, axis=1), columns
+
+
+def fit_stacker(X_train: np.ndarray, y_train: np.ndarray, stacker_name: str, seed: int) -> object:
+    if stacker_name == "mlp":
+        model = MLPClassifier(
+            hidden_layer_sizes=(128, 64),
+            activation="relu",
+            solver="adam",
+            alpha=1e-4,
+            learning_rate_init=1e-3,
+            max_iter=500,
+            random_state=seed,
+        )
+    else:
+        model = LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=seed,
+        )
+    model.fit(X_train, y_train)
+    return model
+
+
 def metric_bundle(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {
         "errors": int((y_true != y_pred).sum()),
@@ -129,12 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args()
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
-    allowed = {"soft", "max", "hard"}
+    allowed = {"soft", "max", "hard", "stacking"}
     bad_methods = sorted(set(methods) - allowed)
     if bad_methods:
         raise ValueError(
             f"Unsupported methods for ensemble CV: {bad_methods}. "
-            "Supported: soft,max,hard."
+            "Supported: soft,max,hard,stacking."
         )
 
     specs = [parse_model_spec(raw) for raw in args.transformer_model]
@@ -177,10 +214,12 @@ def main(argv: list[str] | None = None) -> int:
     base_infer_ms = {spec.name: 0.0 for spec in specs}
     base_fold_scores = {spec.name: [] for spec in specs}
 
-    ens_pred_map = {method: np.empty(n_samples, dtype=object) for method in methods}
-    ens_conf_map = {method: np.zeros(n_samples, dtype=float) for method in methods}
-    ens_infer_ms = {method: 0.0 for method in methods}
-    ens_fold_scores = {method: [] for method in methods}
+    vote_methods = [method for method in methods if method in {"soft", "max", "hard"}]
+    run_stacking = "stacking" in methods
+    ens_pred_map = {method: np.empty(n_samples, dtype=object) for method in vote_methods}
+    ens_conf_map = {method: np.zeros(n_samples, dtype=float) for method in vote_methods}
+    ens_infer_ms = {method: 0.0 for method in vote_methods}
+    ens_fold_scores = {method: [] for method in vote_methods}
 
     fold_dir = output_dir / "_fold_metrics"
     fold_dir.mkdir(parents=True, exist_ok=True)
@@ -247,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    F1 = {fold_f1:.3f}")
 
         fold_prob_stack = np.stack(fold_prob_list, axis=0)
-        for method in methods:
+        for method in vote_methods:
             t0 = time.perf_counter()
             if method == "soft":
                 ensemble_proba, ensemble_pred = soft_vote(fold_prob_stack, labels)
@@ -283,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         })
         save_confusion_matrix(y_true_all.tolist(), pred.tolist(), f"{spec.name}_CV{args.cv}", output_dir)
 
-    for method in methods:
+    for method in vote_methods:
         pred = ens_pred_map[method]
         per_sample[f"pred_ensemble_{method}"] = pred
         per_sample[f"conf_ensemble_{method}"] = ens_conf_map[method]
@@ -298,6 +337,100 @@ def main(argv: list[str] | None = None) -> int:
             **metrics,
         })
         save_confusion_matrix(y_true_all.tolist(), pred.tolist(), f"Ensemble_{method}_CV{args.cv}", output_dir)
+
+    if run_stacking:
+        X_stack, stack_feature_cols = flatten_meta_features(base_proba_map, specs)
+        stack_features_df = pd.DataFrame(X_stack, columns=stack_feature_cols)
+        if "filename" in prepared_df.columns:
+            stack_features_df.insert(0, "filename", prepared_df["filename"].astype(str).values)
+        stack_features_df.insert(0, args.target, y_true_all)
+        stack_features_path = output_dir / "ensemble_cv_meta_features.csv"
+        stack_features_df.to_csv(stack_features_path, index=False, encoding="utf-8", sep=args.sep)
+
+        final_stacker = fit_stacker(
+            X_stack,
+            y_true_all,
+            stacker_name=args.stacker,
+            seed=args.seed,
+        )
+        stacker_path = output_dir / f"stacker_{args.stacker}.joblib"
+        stacker_meta_path = output_dir / f"stacker_{args.stacker}_metadata.json"
+        joblib.dump(final_stacker, stacker_path)
+        stacker_metadata = {
+            "target": args.target,
+            "dataset_variant": args.dataset_variant,
+            "cv": args.cv,
+            "seed": args.seed,
+            "stacker": args.stacker,
+            "labels": labels,
+            "feature_columns": stack_feature_cols,
+            "models": [{"name": spec.name, "model_id": spec.model_id} for spec in specs],
+            "fold_manifest": str(manifest_path),
+            "training_input": str(Path(args.input).resolve()),
+            "meta_features": str(stack_features_path),
+            "note": (
+                "Final stacker is trained on out-of-fold base-model probabilities "
+                "from the full CV dataset. Use it only on an external eval/test set "
+                "that was not used to train base models or the stacker."
+            ),
+        }
+        with open(stacker_meta_path, "w", encoding="utf-8") as f:
+            json.dump(stacker_metadata, f, ensure_ascii=False, indent=2)
+
+        stack_pred = np.empty(n_samples, dtype=object)
+        stack_conf = np.zeros(n_samples, dtype=float)
+        stack_fold_scores = []
+        stack_infer_ms = 0.0
+        for fold_idx, (tr_idx, val_idx) in enumerate(folds, start=1):
+            stacker = fit_stacker(
+                X_stack[tr_idx],
+                y_true_all[tr_idx],
+                stacker_name=args.stacker,
+                seed=args.seed,
+            )
+            t0 = time.perf_counter()
+            fold_pred = stacker.predict(X_stack[val_idx])
+            if hasattr(stacker, "predict_proba"):
+                fold_conf = stacker.predict_proba(X_stack[val_idx]).max(axis=1)
+            else:
+                fold_conf = np.full(len(val_idx), np.nan)
+            stack_infer_ms += (time.perf_counter() - t0) * 1000
+
+            stack_pred[val_idx] = fold_pred
+            stack_conf[val_idx] = fold_conf
+            fold_f1 = f1_score(
+                y_true_all[val_idx],
+                fold_pred,
+                average="weighted",
+                zero_division=0,
+            )
+            stack_fold_scores.append(float(fold_f1))
+            print(f"  [Stacking {args.stacker}] fold {fold_idx} F1 = {fold_f1:.3f}")
+
+        per_sample[f"pred_stacking_{args.stacker}"] = stack_pred
+        per_sample[f"conf_stacking_{args.stacker}"] = stack_conf
+        metrics = metric_bundle(y_true_all, stack_pred)
+        metrics["train_sec"] = np.nan
+        metrics["infer_ms_per_sample"] = round(stack_infer_ms / max(n_samples, 1), 3)
+        results.append({
+            "model": f"Stacking ({args.stacker})",
+            "method": "stacking",
+            "group": "ensemble",
+            "notes": (
+                f"meta_cv={args.cv}; stacker={args.stacker}; "
+                f"folds={','.join(f'{s:.4f}' for s in stack_fold_scores)}"
+            ),
+            **metrics,
+        })
+        save_confusion_matrix(
+            y_true_all.tolist(),
+            stack_pred.tolist(),
+            f"Stacking_{args.stacker}_CV{args.cv}",
+            output_dir,
+        )
+        print(f"Saved stacking meta-features: {stack_features_path}")
+        print(f"Saved final stacker       : {stacker_path}")
+        print(f"Saved stacker metadata    : {stacker_meta_path}")
 
     summary_df = pd.DataFrame(results).sort_values(
         ["f1_weighted", "accuracy"], ascending=[False, False]
