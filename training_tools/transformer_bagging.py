@@ -33,7 +33,7 @@ class ModelSpec:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train bootstrap bagging ensembles for one transformer architecture. "
+            "Train bootstrap bagging ensembles for one or more transformer architectures. "
             "Mode 'cv' evaluates bagging with out-of-fold validation. "
             "Mode 'train-final' trains bootstrap members on the full prepared dataset "
             "with out-of-bag validation and saves them for external evaluation."
@@ -51,8 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-variant",
                         choices=["multiclass", "multiclass_with_spam", "binary_spam"],
                         default="multiclass", help="Dataset variant.")
-    parser.add_argument("--model", required=True,
-                        help="Transformer spec: Name=model_id_or_path")
+    parser.add_argument("--model", action="append", required=True,
+                        help="Transformer spec: Name=model_id_or_path. Can be repeated.")
     parser.add_argument("--n-estimators", type=int, default=5,
                         help="Number of bootstrap transformer members.")
     parser.add_argument("--sample-frac", type=float, default=1.0,
@@ -192,7 +192,7 @@ def finetune_kwargs(args: argparse.Namespace) -> dict:
     }
 
 
-def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
+def run_cv(args: argparse.Namespace, specs: list[ModelSpec], output_dir: Path) -> None:
     methods = parse_methods(args.methods)
     raw_df = load_training_frame(Path(args.input).resolve(), sep=args.sep)
     prepared_df = prepare_dataset(raw_df, args.target, args.dataset_variant)
@@ -216,8 +216,11 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
     print(f"Prepared dataset : {output_dir / 'dataset_prepared.csv'}")
     print(f"Samples          : {n_samples}")
     print(f"Classes          : {labels}")
-    print(f"Base model       : {spec.name} = {spec.model_id}")
-    print(f"Estimators       : {args.n_estimators}")
+    print("Base models      :")
+    for spec in specs:
+        print(f"  - {spec.name} = {spec.model_id}")
+    print(f"Estimators/model : {args.n_estimators}")
+    print(f"Total members    : {len(specs) * args.n_estimators}")
     print(f"Sample fraction  : {args.sample_frac}")
     print(f"Methods          : {methods}")
     print(f"Fold manifest    : {manifest_path} ({'loaded' if manifest_loaded else 'saved'})")
@@ -238,55 +241,60 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
         fold_prob_list = []
         fold_infer_sum = 0.0
 
-        for estimator_idx in range(args.n_estimators):
-            member_seed = args.seed + fold_idx * 1000 + estimator_idx
-            rng = np.random.default_rng(member_seed)
-            boot_idx = bootstrap_indices(tr_idx, y_all, args.sample_frac, labels, rng)
-            X_boot = texts.iloc[boot_idx].to_numpy(dtype=object)
-            y_boot = y_all[boot_idx]
+        for model_idx, spec in enumerate(specs):
+            for estimator_idx in range(args.n_estimators):
+                member_seed = args.seed + fold_idx * 10000 + model_idx * 1000 + estimator_idx
+                rng = np.random.default_rng(member_seed)
+                boot_idx = bootstrap_indices(tr_idx, y_all, args.sample_frac, labels, rng)
+                X_boot = texts.iloc[boot_idx].to_numpy(dtype=object)
+                y_boot = y_all[boot_idx]
 
-            print(
-                f"  [{spec.name}] bag {estimator_idx + 1}/{args.n_estimators} "
-                f"(seed={member_seed}, boot={len(boot_idx)})"
-            )
-            result = _finetune_transformer(
-                model_name=spec.model_id,
-                friendly_name=f"{spec.name} bag{estimator_idx + 1} fold{fold_idx}",
-                X_train=X_boot,
-                y_train=y_boot,
-                X_test=X_val,
-                y_test=y_val,
-                store=None,
-                output_dir=fold_dir,
-                save_model=False,
-                silent=True,
-                return_details=True,
-                seed=member_seed,
-                **finetune_kwargs(args),
-            )
-            if result is None:
-                raise RuntimeError(f"Fold {fold_idx}, bag {estimator_idx + 1}: training failed.")
+                print(
+                    f"  [{spec.name}] bag {estimator_idx + 1}/{args.n_estimators} "
+                    f"(seed={member_seed}, boot={len(boot_idx)})"
+                )
+                result = _finetune_transformer(
+                    model_name=spec.model_id,
+                    friendly_name=f"{spec.name} bag{estimator_idx + 1} fold{fold_idx}",
+                    X_train=X_boot,
+                    y_train=y_boot,
+                    X_test=X_val,
+                    y_test=y_val,
+                    store=None,
+                    output_dir=fold_dir,
+                    save_model=False,
+                    silent=True,
+                    return_details=True,
+                    seed=member_seed,
+                    **finetune_kwargs(args),
+                )
+                if result is None:
+                    raise RuntimeError(
+                        f"Fold {fold_idx}, model {spec.name}, bag {estimator_idx + 1}: training failed."
+                    )
 
-            aligned = align_proba(
-                np.asarray(result["proba"], dtype=float),
-                list(result["classes"]),
-                labels,
-            )
-            fold_prob_list.append(aligned)
-            fold_infer_sum += float(result["infer_ms"])
-            member_scores.append({
-                "fold": fold_idx,
-                "bag": estimator_idx + 1,
-                "seed": member_seed,
-                "bootstrap_size": int(len(boot_idx)),
-                "f1_weighted": float(result["f1"]),
-                "train_sec": float(result["train_sec"]),
-                "infer_ms": float(result["infer_ms"]),
-                "best_epoch": int(result["best_epoch"]),
-                "best_val_loss": float(result["best_val_loss"]),
-                "best_val_f1": float(result["best_val_f1"]),
-            })
-            print(f"    member F1 = {float(result['f1']):.3f}")
+                aligned = align_proba(
+                    np.asarray(result["proba"], dtype=float),
+                    list(result["classes"]),
+                    labels,
+                )
+                fold_prob_list.append(aligned)
+                fold_infer_sum += float(result["infer_ms"])
+                member_scores.append({
+                    "fold": fold_idx,
+                    "model": spec.name,
+                    "model_id": spec.model_id,
+                    "bag": estimator_idx + 1,
+                    "seed": member_seed,
+                    "bootstrap_size": int(len(boot_idx)),
+                    "f1_weighted": float(result["f1"]),
+                    "train_sec": float(result["train_sec"]),
+                    "infer_ms": float(result["infer_ms"]),
+                    "best_epoch": int(result["best_epoch"]),
+                    "best_val_loss": float(result["best_val_loss"]),
+                    "best_val_f1": float(result["best_val_f1"]),
+                })
+                print(f"    member F1 = {float(result['f1']):.3f}")
 
         prob_stack = np.stack(fold_prob_list, axis=0)
         for method in methods:
@@ -311,7 +319,7 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
         metrics["train_sec"] = np.nan
         metrics["infer_ms_per_sample"] = round(method_infer_ms[method] / max(n_samples, 1), 3)
         rows.append({
-            "model": f"Bagging {spec.name} ({args.n_estimators}x, {method})",
+            "model": f"Bagging top{len(specs)} ({len(specs) * args.n_estimators}x, {method})",
             "method": f"bagging_{method}",
             "group": "ensemble",
             "notes": (
@@ -321,7 +329,12 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
             ),
             **metrics,
         })
-        save_confusion_matrix(y_all.tolist(), pred.tolist(), f"Bagging_{spec.name}_{method}_CV{args.cv}", output_dir)
+        save_confusion_matrix(
+            y_all.tolist(),
+            pred.tolist(),
+            f"Bagging_top{len(specs)}_{method}_CV{args.cv}",
+            output_dir,
+        )
 
     summary_df = pd.DataFrame(rows).sort_values(
         ["f1_weighted", "accuracy"], ascending=[False, False]
@@ -340,7 +353,7 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
         "dataset_variant": args.dataset_variant,
         "cv": args.cv,
         "seed": args.seed,
-        "model": {"name": spec.name, "model_id": spec.model_id},
+        "models": [{"name": spec.name, "model_id": spec.model_id} for spec in specs],
         "n_estimators": args.n_estimators,
         "sample_frac": args.sample_frac,
         "methods": methods,
@@ -359,7 +372,7 @@ def run_cv(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
     print(f"Saved summary    : {summary_json}")
 
 
-def run_train_final(args: argparse.Namespace, spec: ModelSpec, output_dir: Path) -> None:
+def run_train_final(args: argparse.Namespace, specs: list[ModelSpec], output_dir: Path) -> None:
     raw_df = load_training_frame(Path(args.input).resolve(), sep=args.sep)
     prepared_df = prepare_dataset(raw_df, args.target, args.dataset_variant)
     save_prepared_dataset(prepared_df, output_dir / "dataset_prepared.csv", sep=args.sep)
@@ -373,8 +386,11 @@ def run_train_final(args: argparse.Namespace, spec: ModelSpec, output_dir: Path)
     print(f"Prepared dataset : {output_dir / 'dataset_prepared.csv'}")
     print(f"Samples          : {len(prepared_df)}")
     print(f"Classes          : {labels}")
-    print(f"Base model       : {spec.name} = {spec.model_id}")
-    print(f"Estimators       : {args.n_estimators}")
+    print("Base models      :")
+    for spec in specs:
+        print(f"  - {spec.name} = {spec.model_id}")
+    print(f"Estimators/model : {args.n_estimators}")
+    print(f"Total members    : {len(specs) * args.n_estimators}")
     print(f"Sample fraction  : {args.sample_frac}")
     print("Validation       : out-of-bag rows for each bootstrap member")
 
@@ -382,57 +398,62 @@ def run_train_final(args: argparse.Namespace, spec: ModelSpec, output_dir: Path)
     model_specs = []
     store = ResultStore()
 
-    for estimator_idx in range(args.n_estimators):
-        member_seed = args.seed + estimator_idx
-        rng = np.random.default_rng(member_seed)
-        boot_idx = bootstrap_indices(all_indices, y_all, args.sample_frac, labels, rng)
-        boot_unique = np.unique(boot_idx)
-        oob_idx = np.setdiff1d(all_indices, boot_unique, assume_unique=False)
-        if len(oob_idx) == 0:
-            raise RuntimeError(
-                "Bootstrap produced no out-of-bag rows. Reduce --sample-frac or increase dataset size."
+    for model_idx, spec in enumerate(specs):
+        for estimator_idx in range(args.n_estimators):
+            member_seed = args.seed + model_idx * 1000 + estimator_idx
+            rng = np.random.default_rng(member_seed)
+            boot_idx = bootstrap_indices(all_indices, y_all, args.sample_frac, labels, rng)
+            boot_unique = np.unique(boot_idx)
+            oob_idx = np.setdiff1d(all_indices, boot_unique, assume_unique=False)
+            if len(oob_idx) == 0:
+                raise RuntimeError(
+                    "Bootstrap produced no out-of-bag rows. Reduce --sample-frac or increase dataset size."
+                )
+
+            friendly_name = f"{spec.name}_bag{estimator_idx + 1}"
+            print(
+                f"\n[{friendly_name}] seed={member_seed}, "
+                f"boot={len(boot_idx)}, unique={len(boot_unique)}, oob={len(oob_idx)}"
             )
+            result = _finetune_transformer(
+                model_name=spec.model_id,
+                friendly_name=friendly_name,
+                X_train=texts.iloc[boot_idx].to_numpy(dtype=object),
+                y_train=y_all[boot_idx],
+                X_test=texts.iloc[oob_idx].to_numpy(dtype=object),
+                y_test=y_all[oob_idx],
+                store=store,
+                output_dir=output_dir,
+                save_model=True,
+                silent=False,
+                return_details=True,
+                seed=member_seed,
+                **finetune_kwargs(args),
+            )
+            if result is None:
+                raise RuntimeError(
+                    f"Final model {spec.name}, bag {estimator_idx + 1}: training failed."
+                )
 
-        friendly_name = f"{spec.name}_bag{estimator_idx + 1}"
-        print(
-            f"\n[{friendly_name}] seed={member_seed}, "
-            f"boot={len(boot_idx)}, unique={len(boot_unique)}, oob={len(oob_idx)}"
-        )
-        result = _finetune_transformer(
-            model_name=spec.model_id,
-            friendly_name=friendly_name,
-            X_train=texts.iloc[boot_idx].to_numpy(dtype=object),
-            y_train=y_all[boot_idx],
-            X_test=texts.iloc[oob_idx].to_numpy(dtype=object),
-            y_test=y_all[oob_idx],
-            store=store,
-            output_dir=output_dir,
-            save_model=True,
-            silent=False,
-            return_details=True,
-            seed=member_seed,
-            **finetune_kwargs(args),
-        )
-        if result is None:
-            raise RuntimeError(f"Final bag {estimator_idx + 1}: training failed.")
-
-        model_dir = output_dir / friendly_name
-        member_rows.append({
-            "bag": estimator_idx + 1,
-            "seed": member_seed,
-            "model_name": friendly_name,
-            "model_dir": str(model_dir),
-            "bootstrap_size": int(len(boot_idx)),
-            "bootstrap_unique_rows": int(len(boot_unique)),
-            "oob_rows": int(len(oob_idx)),
-            "oob_f1_weighted": float(result["f1"]),
-            "train_sec": float(result["train_sec"]),
-            "infer_ms": float(result["infer_ms"]),
-            "best_epoch": int(result["best_epoch"]),
-            "best_val_loss": float(result["best_val_loss"]),
-            "best_val_f1": float(result["best_val_f1"]),
-        })
-        model_specs.append(f'--transformer-model "{friendly_name}={model_dir}"')
+            model_dir = output_dir / friendly_name
+            member_rows.append({
+                "model": spec.name,
+                "model_id": spec.model_id,
+                "bag": estimator_idx + 1,
+                "seed": member_seed,
+                "model_name": friendly_name,
+                "model_dir": str(model_dir),
+                "bootstrap_size": int(len(boot_idx)),
+                "bootstrap_unique_rows": int(len(boot_unique)),
+                "oob_rows": int(len(oob_idx)),
+                "oob_f1_weighted": float(result["f1"]),
+                "train_sec": float(result["train_sec"]),
+                "infer_ms": float(result["infer_ms"]),
+                "best_epoch": int(result["best_epoch"]),
+                "best_val_loss": float(result["best_val_loss"]),
+                "best_val_f1": float(result["best_val_f1"]),
+            })
+            model_specs.append(f'--transformer-model "{friendly_name}={model_dir}"')
 
     members_df = pd.DataFrame(member_rows)
     members_path = output_dir / "bagging_members.csv"
@@ -450,7 +471,7 @@ def run_train_final(args: argparse.Namespace, spec: ModelSpec, output_dir: Path)
         "target": args.target,
         "dataset_variant": args.dataset_variant,
         "seed": args.seed,
-        "model": {"name": spec.name, "model_id": spec.model_id},
+        "models": [{"name": spec.name, "model_id": spec.model_id} for spec in specs],
         "n_estimators": args.n_estimators,
         "sample_frac": args.sample_frac,
         "members": member_rows,
@@ -475,14 +496,14 @@ def main() -> int:
     if args.n_estimators < 2:
         raise ValueError("--n-estimators must be at least 2.")
 
-    spec = parse_model_spec(args.model)
+    specs = [parse_model_spec(raw) for raw in args.model]
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "cv":
-        run_cv(args, spec, output_dir)
+        run_cv(args, specs, output_dir)
     else:
-        run_train_final(args, spec, output_dir)
+        run_train_final(args, specs, output_dir)
     return 0
 
 
